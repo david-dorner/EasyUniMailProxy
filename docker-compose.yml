@@ -1,0 +1,49 @@
+# EasyUniMailProxy - transparent (passthrough) IMAP/SMTP proxy over the
+# University of Graz VPN. See docs/DEVELOPMENT.md for the full design.
+
+services:
+  # ── The tunnel + the raw-TCP passthrough relays (folded into one container so
+  #    the relays share the VPN's exact lifecycle and always restart with it). ──
+  vpn:
+    build: ./vpn
+    container_name: eump-vpn
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    env_file: .env
+    # Keep BIND_ADDR firewalled to trusted clients (README -> Security).
+    ports:
+      - "${BIND_ADDR:-0.0.0.0}:993:993"   # IMAPS (implicit TLS, end-to-end)
+      - "${BIND_ADDR:-0.0.0.0}:587:587"   # SMTP submission (STARTTLS, end-to-end)
+    volumes:
+      - vpn-config:/config
+    healthcheck:
+      # Reachable through the tunnel? (bash /dev/tcp avoids extra deps)
+      test: ["CMD-SHELL", "timeout 5 bash -c '</dev/tcp/email.uni-graz.at/993' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ── Watches the whole mail path; alerts via ntfy on breakage. ──
+  # Runs in its OWN namespace so it survives a vpn-container failure and can
+  # still alert (over the normal internet, not the tunnel).
+  watchdog:
+    build: ./watchdog
+    container_name: eump-watchdog
+    restart: unless-stopped
+    depends_on:
+      vpn:
+        condition: service_started
+    environment:
+      WATCHDOG_TARGET_HOST: vpn      # reach the relay via the compose network
+      WATCHDOG_TARGET_PORT: "993"
+      WATCHDOG_INTERVAL: "60"
+      WATCHDOG_FAIL_THRESHOLD: "3"
+      NTFY_URL: "${NTFY_URL:-}"
+      NTFY_TOKEN: "${NTFY_TOKEN:-}"
+
+volumes:
+  vpn-config:

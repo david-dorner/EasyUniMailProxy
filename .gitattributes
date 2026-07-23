@@ -1,0 +1,5 @@
+# This is a Linux and Docker project. Shell scripts, the container entrypoint,
+# and everything else must use LF line endings: a stray CRLF in the entrypoint
+# breaks the shebang on Linux. Force LF on every text file regardless of the
+# machine git runs on. There are no binary files in this repository.
+* text=auto eol=lf

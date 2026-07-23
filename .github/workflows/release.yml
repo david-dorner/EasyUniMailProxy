@@ -1,0 +1,68 @@
+# Release tagging.
+#
+# This project is deployed with `docker compose up` (the images are built
+# locally on the host), so nothing is built or published to a registry here.
+# The only job of this workflow is version tracking: on a push to main it reads
+# the VERSION file, and if no git tag v{VERSION} exists yet, it creates the tag
+# and a GitHub release using the matching CHANGELOG.md section as the notes.
+# That is how users see that a newer version is available. Pushing ordinary
+# commits without bumping VERSION never releases.
+#
+# To publish a release: bump VERSION, add a matching "## x.y.z" section to
+# CHANGELOG.md, and push to main.
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Read VERSION and check whether it is already released
+        id: version
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          if ! printf '%s' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "VERSION must contain a semantic version (x.y.z), got '$version'"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1; then
+            echo "Tag v$version already exists - nothing to release."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag v$version not found - creating release."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract release notes from CHANGELOG.md
+        if: steps.version.outputs.exists == 'false'
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          awk -v v="$version" '
+            $0 ~ "^## +" v "([^0-9]|$)" { inSection=1; next }
+            inSection && /^## +/ { exit }
+            inSection { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "EasyUniMailProxy $version" > release-notes.md
+          fi
+
+      - name: Create GitHub release
+        if: steps.version.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: EasyUniMailProxy ${{ steps.version.outputs.version }}
+          body_path: release-notes.md

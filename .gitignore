@@ -1,0 +1,7 @@
+# Secrets and local state, never commit these.
+.env
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
