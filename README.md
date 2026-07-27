@@ -38,6 +38,9 @@ Your phone / laptop   ---- IMAPS 993, SMTP 587 (TLS end to end) ---->   [ your b
 - One **carrier** university account (in `.env`) keeps the VPN tunnel up.
 - Every user logs into **their own** mailbox through it, with their own password.
 - No mail and no user passwords are stored on the box; it only forwards bytes.
+- If the tunnel drops it reconnects from the existing session in about a second,
+  and a monitor tracks uptime and alerts you (over the normal internet) on any
+  sustained outage.
 
 For the full design, see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
@@ -111,6 +114,33 @@ Whichever you choose:
 
 ---
 
+## Alternative: run it on your own machine
+
+You do not strictly need a separate server. If you just want constant mail access
+on one computer, without putting the VPN into your mail client, you can run the
+whole stack locally and point your mail app at `localhost`:
+
+- **Linux:** run it natively.
+- **Windows:** run it inside WSL2 (Docker Desktop with the WSL2 backend, or Docker
+  inside a WSL2 distribution).
+- **macOS:** run it under Docker Desktop.
+
+Set `BIND_ADDR=127.0.0.1` in `.env` so the mail ports listen only on the loopback
+interface (nothing is exposed to the network), then configure your mail client
+with server `127.0.0.1` and ports 993 and 587, as in the next section.
+
+Two notes. The tunnel and relays only run while that machine is on and the
+containers are up, so this gives you access on that one machine rather than
+everywhere. And on your own machine you can make the certificate prompt disappear
+cleanly: add `127.0.0.1 email.uni-graz.at` to your hosts file (`/etc/hosts` on
+Linux and macOS, `C:\Windows\System32\drivers\etc\hosts` on Windows) and set the
+mail server to `email.uni-graz.at`. Your client then dials that name, the
+passthrough presents the real matching certificate, and there is no warning. The
+container is unaffected, because it resolves the real server itself in its own
+network namespace, independent of your hosts file.
+
+---
+
 ## Mail client settings
 
 Use your normal university settings, and change only the **server** to your box.
@@ -172,10 +202,14 @@ mail.
   do not expose them to the open internet. Set `BIND_ADDR` in `.env` to bind to
   a private interface. Full guidance is in
   [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
-- **Watchdog alerts.** A monitor probes the whole mail path every minute and
-  sends an ntfy alert if the VPN or relay goes down, and again when it recovers.
-  Alerts travel over the normal internet, so they reach you even while the VPN
-  is broken.
+- **Watchdog alerts and statistics.** A monitor probes the whole mail path every
+  minute (and every few seconds during a failure, to time it precisely) and sends
+  an ntfy alert, carrying the current uptime, if the VPN or relay goes down and
+  again when it recovers. Alerts travel over the normal internet, so they reach
+  you even while the VPN is broken. It also keeps durable, size-bounded uptime and
+  per-outage statistics (24h / 7d / 30d / all-time, and each outage's duration,
+  cause, and shape) you can inspect. See
+  [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 - The carrier VPN password lives in `.env`, which is the operator's own
   credential, not any user's. Keep the host secured accordingly.
 
@@ -194,6 +228,9 @@ the test suite in [tests/](tests/).
   `docker compose logs watchdog`; the whole path is probed there.
 - **A certificate warning appears in the client.** This is expected; accept the
   `email.uni-graz.at` certificate once (see above).
+- **Checking uptime or past outages.** The watchdog keeps statistics in its
+  volume; read them with `docker compose exec watchdog cat /data/state.json` (or
+  `/data/outages.jsonl`). See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ---
 

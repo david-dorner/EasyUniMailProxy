@@ -40,10 +40,15 @@ services:
     environment:
       WATCHDOG_TARGET_HOST: vpn      # reach the relay via the compose network
       WATCHDOG_TARGET_PORT: "993"
-      WATCHDOG_INTERVAL: "60"
-      WATCHDOG_FAIL_THRESHOLD: "3"
+      WATCHDOG_INTERVAL: "60"        # probe every 60s while healthy
+      WATCHDOG_FAIL_INTERVAL: "5"    # probe every 5s during a failure (time the outage)
+      WATCHDOG_FAIL_THRESHOLD: "3"   # DOWN alert after 3 consecutive failures
+      WATCHDOG_STATS_DIR: /data      # uptime + outage stats live here (persisted)
       NTFY_URL: "${NTFY_URL:-}"
       NTFY_TOKEN: "${NTFY_TOKEN:-}"
+    volumes:
+      - watchdog-stats:/data         # keep statistics across restarts
 
 volumes:
   vpn-config:
+  watchdog-stats:

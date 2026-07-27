@@ -42,6 +42,12 @@ RUN pip install --no-cache-dir openconnect-saml keyrings.alt
 # GPL-3.0) does. See docs/DEVELOPMENT.md / headless.py header.
 COPY headless.py /usr/local/lib/python3.12/site-packages/openconnect_saml/headless.py
 
+# vpnc-script wrapper: install the tunnel routes but never rewrite resolv.conf,
+# so an unclean tunnel death can't leave DNS pointing at now-unreachable uni
+# resolvers and block the next reconnect (see vpnc-noresolv header).
+COPY vpnc-noresolv /usr/local/bin/vpnc-noresolv
+RUN chmod +x /usr/local/bin/vpnc-noresolv
+
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

@@ -52,11 +52,12 @@ EasyUniMailProxy/
 ├── .env.example                Configuration template
 ├── vpn/
 │   ├── Dockerfile              openconnect + socat + openconnect-saml + patch
-│   ├── entrypoint.sh           keyring/profile, DNS wait, relays, connect
+│   ├── entrypoint.sh           keyring/profile, DNS wait, relays, token supervisor
+│   ├── vpnc-noresolv           vpnc-script wrapper: install routes, never touch DNS
 │   └── headless.py             Patched openconnect-saml headless authenticator
 ├── watchdog/
 │   ├── Dockerfile
-│   └── watchdog.py             Mail-path probe and ntfy alerts
+│   └── watchdog.py             Mail-path probe, ntfy alerts, uptime/outage stats
 └── tests/                      Integration suite (see section 10)
     ├── run-tests.sh
     ├── helpers/common.sh
@@ -212,43 +213,118 @@ not any user's mailbox.
 
 ---
 
-## 6. Reliability and self-healing
+## 6. VPN reliability: session model, transport, and self-healing
 
-- **Brief network blips** are handled inside the tunnel by openconnect itself
-  (its own reconnect), with no re-auth and no new one-time code.
-- **A full tunnel drop** is handled by the supervisor loop in the entrypoint. It
-  runs one `openconnect-saml connect` at a time (not openconnect-saml's own
-  `--reconnect`, so the timing is ours), and when that returns it re-runs the
-  headless SAML flow with a short backoff (`VPN_RECONNECT_BACKOFF`, default 35
-  seconds, deliberately above the 30-second one-time-code window so Keycloak
-  never sees a replayed code).
-- **The roughly 24-hour session expiry** is handled proactively. The university
-  expires the VPN session about 24 hours after sign-in (openconnect logs the
-  exact time as "Session authentication will expire at ..."). Rather than wait
-  for that hard expiry, where openconnect can retry a dead session for minutes,
-  the supervisor re-authenticates at fixed local times (`VPN_REFRESH_TIMES`,
+### The session model (measured, not assumed)
+
+The reconnect strategy is built on how the Graz gateway actually treats a
+session, established by probing the live gateway:
+
+- **A login mints a bearer token.** The SAML plus TOTP login returns a Cisco
+  AnyConnect session cookie (shaped `sessionID@...@...@hash`). openconnect needs
+  only that cookie to raise the tunnel, and does so in about a second, with no
+  second login.
+- **The token is reusable and survives a drop.** The same cookie brings the
+  tunnel back up repeatedly. An *unclean* loss of the tunnel (the process is
+  hard-killed, or the network dies) leaves the session valid server-side, so a
+  reconnect from the cookie succeeds.
+- **A clean logout is what ends the session.** openconnect, on `SIGTERM`, sends
+  the gateway a disconnect and the cookie is then rejected (HTTP 401). Whether
+  the token survives therefore depends entirely on how openconnect stops: a hard
+  `SIGKILL` (no disconnect sent) preserves it; a `SIGTERM` retires it.
+- **One token can carry several tunnels at once.** A second openconnect started
+  from the same cookie raises a second tunnel that also carries traffic. This is
+  what would make a zero-gap make-before-break refresh possible if the data ever
+  shows it is needed (see below).
+- **The session hard-expires after about 24 hours**, independent of activity
+  (openconnect logs "Session authentication will expire at ...").
+
+### The supervisor
+
+`vpn/entrypoint.sh` is built directly on those facts, and separates the two
+things a sign-in does:
+
+- `mint_token` runs the login **once** (`openconnect-saml ... --authenticate
+  shell`) and captures the cookie, the server-certificate pin, and the gateway
+  URL. `run_tunnel` then hands that cookie to a plain `openconnect` call. The
+  token is held in memory only, never written to disk.
+- On a drop the loop **reconnects from the held token** (about one second) and
+  logs in again only when the token is actually spent (the gateway rejects it,
+  matched from openconnect's output) or is near its 24-hour age
+  (`VPN_TOKEN_MAX_AGE`, default 20 hours). This replaces the previous behaviour
+  of repeating the full SAML login on every reconnect.
+- It stops openconnect with **`SIGKILL` for an unplanned drop** (preserving the
+  token so it can be reused) and with **`SIGTERM` only when deliberately retiring
+  a session** (a planned refresh, or container shutdown via the entrypoint's
+  `trap`), so the gateway is not left with dangling sessions when it can be
+  avoided.
+- Two safeguards bound the login rate: `mint_token` never begins a login within
+  `MIN_MINT_SPACING` (32 s) of the previous one, so a burst can never replay a
+  one-time code; and three consecutive immediate exits force a fresh login rather
+  than a hot reconnect loop on a token that has gone bad in a way the output
+  patterns did not catch.
+
+Measured recovery from a hard tunnel kill, reconnecting from the token, is about
+1.5 seconds, versus the multi-second full re-login it replaces.
+
+### Transport: forced TCP
+
+The tunnel is forced over TCP (`openconnect --no-dtls`). The default UDP/DTLS
+transport is prone to silent NAT-timeout drops behind a home router, where the
+datagram flow simply stops and the client only notices at the next dead-peer
+check; those were the main source of the recurring short outages. TCP costs a
+little latency, irrelevant for mail, for a connection that stays up. `VPN_DPD`
+(default 5 s) bounds how fast a genuinely dead peer is noticed;
+`VPN_RECONNECT_TIMEOUT` (default 25 s) caps how long openconnect retries in place
+before it exits and the supervisor takes over.
+
+### DNS: never break resolv.conf
+
+openconnect's stock `vpnc-script` rewrites `/etc/resolv.conf` to the uni-internal
+resolvers, which are reachable only through the tunnel. On an unclean drop its
+teardown never runs, so `/etc/resolv.conf` is left pointing at now-unreachable
+servers, and the next reconnect cannot even resolve the gateway hostname; a
+one-second blip becomes a long outage. `vpn/vpnc-noresolv` wraps `vpnc-script`
+and clears `INTERNAL_IP4_DNS`, so the routes are still installed but DNS is left
+untouched (`vpnc-script` only edits `resolv.conf` when that variable is set).
+This is safe because `email.uni-graz.at` resolves on **public** DNS to an address
+inside the tunnel's route range, so the uni resolvers are never needed. As a
+further guard the gateway's address is pinned in `/etc/hosts` at startup, so a
+reconnect never depends on DNS at all.
+
+### The rest of the safety net
+
+- **The ~24-hour session expiry** is handled proactively. Rather than wait for
+  the hard expiry, where openconnect can retry a dead session for minutes, the
+  supervisor cycles to a fresh token at fixed local times (`VPN_REFRESH_TIMES`,
   default `03:00,04:00`, read in `TZ`). Two times a day keep the largest gap
-  under 24 hours with no drift, so a refresh always lands before the session can
-  expire; the entrypoint warns if the configured times leave a gap of 24 hours
-  or more. A planned refresh reconnects immediately (no anti-replay wait, since
-  the session is at least an hour old), so the gap is about four seconds, at a
-  quiet hour by default; an unexpected drop keeps the longer 35-second backoff.
-- **A process crash or container exit** is handled by
-  `restart: unless-stopped`. Because the relays are folded into the vpn
-  container, they restart with the tunnel.
+  under 24 hours with no drift; the entrypoint warns if the configured times
+  leave a gap of 24 hours or more.
+- **A process crash or container exit** is handled by `restart: unless-stopped`.
+  Because the relays are folded into the vpn container, they restart with it.
 - **A cold-start DNS race** is handled by a wait loop in the entrypoint: Docker's
   embedded resolver can lag for a second or two at container start, which would
-  otherwise fail the first connect with "Failed to resolve univpn.uni-graz.at"
-  and force a restart.
-- **A relay crash** is handled by a per-relay restart loop in the entrypoint
+  otherwise fail the first connect and force a restart.
+- **A relay crash** is handled by a per-relay restart loop
   (`while true; do socat ...; done`).
 - **Anything the above misses** (a silently dead tunnel, an unreachable upstream,
   a stopped relay, or the vpn container itself down) is caught by the watchdog,
-  which alerts.
+  which alerts and records it.
 
 The client-visible effect of a reconnect is that the client's connection drops
 and the mail app reconnects automatically, the same as a laptop briefly losing
 Wi-Fi.
+
+### If sub-second failover is ever needed
+
+The measured ~1.5 s reconnect closes most of the gap, and forcing TCP should make
+unplanned drops rare in the first place. If the watchdog statistics later show
+that residual drops still hurt, the session model already permits a zero-gap
+make-before-break refresh: a second tunnel can be raised on the same token (or a
+freshly minted one) and traffic switched to it before the first is torn down, so
+there is no interruption at all. The egress firewall already matches any tunnel
+interface (`tun+`) to allow for a transient second tunnel. This is deliberately
+left unimplemented until the data justifies the added complexity.
 
 ---
 
@@ -270,28 +346,74 @@ healthy check (which also confirms the alert path works), a DOWN alert after
 path returns. Steady state is silent. The alert emoji seen on the phone comes
 from ntfy's `Tags` field (for example `rotating_light`, `warning`,
 `white_check_mark`), which is the idiomatic ntfy way to render icons; the code
-itself carries no emoji. There is no `docker.sock`-based auto-restarter:
-recovery is handled by `--reconnect` and the Docker restart policy, and the
-watchdog reports anything that slips through.
+itself carries no emoji. There is no `docker.sock`-based auto-restarter: recovery
+is handled by the supervisor and the Docker restart policy, and the watchdog
+reports anything that slips through.
+
+### Statistics
+
+The watchdog also keeps durable, size-bounded uptime and outage statistics under
+`WATCHDOG_STATS_DIR` (default `/data`, a persisted volume), so you can answer
+"what is my real uptime, and what did each outage look like":
+
+- **Adaptive probing.** While healthy it probes every `WATCHDOG_INTERVAL`. The
+  moment a probe fails it switches to `WATCHDOG_FAIL_INTERVAL` (default 5 s) so
+  an outage's start, shape, and recovery are timed to the second, then returns to
+  the relaxed interval once healthy. This is what makes a ~1 s reconnect
+  measurable.
+- **Every failure streak is recorded** as one outage record, including a brief
+  blip that never crossed the alert threshold (the record's `alerted` flag says
+  whether it did). Alerts still fire only on a sustained streak, so the data is
+  rich without the notifications becoming noisy.
+- **Uptime is lossless.** Up and down seconds are accumulated per calendar day,
+  so 24h / 7d / 30d / all-time percentages are exact without storing every probe.
+  Time is credited to the state the path was in during each interval; a gap
+  larger than twice the interval (a watchdog restart) is capped so it cannot dump
+  a false block of downtime.
+
+Three files, each bounded so they never grow without limit:
+
+| File | Contents | Bound |
+|---|---|---|
+| `state.json` | Current snapshot: health, consecutive fails, lifetime counters, the uptime summary, the current and last outage. Rewritten each probe. | Fixed size |
+| `daily.json` | One row per day: up / down / monitored seconds, probe counts, outage count, longest outage. | `WATCHDOG_MAX_DAYS` rows (default 400) |
+| `outages.jsonl` | One line per finished outage: start, end, duration, failed-check count, `alerted`, the distinct error strings (the cause), and a capped probe-by-probe trace (the shape: offset, latency, error per sample). | `WATCHDOG_MAX_OUTAGES` lines (default 2000), `WATCHDOG_MAX_SAMPLES` samples per outage (default 600) |
+
+Even after years this stays well under a couple of megabytes. If the watchdog
+restarts mid-outage it resumes the in-progress outage as one continuous record
+rather than splitting it. DOWN and recovery alerts carry the current uptime
+figures; `WATCHDOG_LOG_SUMMARY_EVERY` (default hourly) also prints an uptime line
+to the container log, and `WATCHDOG_DAILY_SUMMARY=1` optionally pushes a once-a-day
+digest to ntfy (off by default, to keep alerts quiet). Read the current numbers
+with, for example:
+
+```
+docker compose exec watchdog cat /data/state.json
+docker compose exec watchdog cat /data/outages.jsonl
+```
 
 ---
 
 ## 8. DNS and routing
 
-DNS and routing to the mail server work without extra configuration on the
-network tested. openconnect's `vpnc-script` rewrites `/etc/resolv.conf` with the
-university resolvers, `email.uni-graz.at` resolves to an address inside the
-split-tunnel route pushed by the VPN, and ports 993 and 587 are reachable
-through the tunnel.
+The box keeps the container's normal (public) DNS and deliberately does **not**
+adopt the university resolvers; see section 6 ("DNS: never break resolv.conf")
+for why. This works because `email.uni-graz.at` resolves on public DNS to an
+address that falls inside the split-tunnel route the VPN pushes
+(`143.50.0.0/16`), so the relay reaches it over the tunnel regardless of which
+resolver named it. Ports 993 and 587 are reachable through the tunnel, and the
+gateway's own address is pinned in `/etc/hosts` at startup so a reconnect never
+depends on a resolver.
 
 If a future network change breaks this, the knobs are still present:
 
-- Some Docker setups mount `/etc/resolv.conf` read-only, which stops
-  `vpnc-script` from installing the VPN's DNS. Set `dns:` in `docker-compose.yml`
-  to the university resolver (reachable once the tunnel is up), or pin the
-  server address with `extra_hosts`.
+- If `email.uni-graz.at` ever stops resolving publicly, add it to `extra_hosts`
+  in `docker-compose.yml` pointing at its in-tunnel address, or drop the
+  `--script vpnc-noresolv` override so the tunnel installs the university
+  resolvers again (accepting the reconnect fragility that override exists to
+  avoid).
 - On a split tunnel where the mail server's subnet is not pushed, add a route by
-  passing `--route <CIDR>` through an extra openconnect-saml argument.
+  passing `--route <CIDR>` as an extra openconnect argument in `run_tunnel`.
 
 Note that the university's port 465 is open at the TCP level but does not speak
 implicit TLS; submission is 587 with STARTTLS, which is what the relay forwards.
@@ -316,6 +438,28 @@ All configuration is in `.env` (copied from `.env.example`):
 The VPN server (`univpn.uni-graz.at`), the mail server (`email.uni-graz.at`),
 and the profile name are constants baked into the images, because this project
 targets one university.
+
+### Advanced tuning (optional, safe defaults)
+
+These rarely need changing; they exist so behaviour can be tuned without editing
+code. Set them in the service `environment:` (watchdog) or via `.env` (vpn).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `VPN_DPD` | `5` | Dead-peer-detection interval (s): how fast a silent drop is noticed |
+| `VPN_RECONNECT_TIMEOUT` | `25` | How long openconnect retries its transport in place before it exits to the supervisor (s) |
+| `VPN_TOKEN_MAX_AGE` | `72000` | Re-authenticate a session token once it reaches this age (s); default 20h, under the ~24h expiry |
+| `VPN_RECONNECT_SETTLE` | `1` | Settle pause before reconnecting from an existing token after a drop (s) |
+| `VPN_MINT_BACKOFF` | `35` | Pause after a failed login before retrying (s); above the one-time-code window |
+| `WATCHDOG_INTERVAL` | `60` | Probe interval while healthy (s) |
+| `WATCHDOG_FAIL_INTERVAL` | `5` | Probe interval during a failure (s), to time an outage precisely |
+| `WATCHDOG_FAIL_THRESHOLD` | `3` | Consecutive failures before a DOWN alert |
+| `WATCHDOG_STATS_DIR` | `/data` | Where uptime/outage statistics are persisted |
+| `WATCHDOG_MAX_DAYS` | `400` | Daily rows kept in `daily.json` |
+| `WATCHDOG_MAX_OUTAGES` | `2000` | Outage lines kept in `outages.jsonl` |
+| `WATCHDOG_MAX_SAMPLES` | `600` | Probe samples stored per outage's shape |
+| `WATCHDOG_LOG_SUMMARY_EVERY` | `3600` | Log an uptime line this often (s); `0` disables |
+| `WATCHDOG_DAILY_SUMMARY` | `0` | `1` also pushes a once-a-day uptime digest to ntfy |
 
 `AUTH_ONLY=1`, passed to the vpn container, validates the carrier credentials and
 exits without opening the tunnel. It needs no `NET_ADMIN` or `/dev/net/tun`,

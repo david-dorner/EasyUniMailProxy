@@ -5,6 +5,19 @@
 # container there is no Secret Service, so we use the PlaintextKeyring backend
 # and pre-load the two secrets from the environment. The container filesystem
 # is already the trust boundary (see docs/DEVELOPMENT.md, Security section).
+#
+# The supervisor splits the two things a VPN sign-in actually does:
+#   1. AUTHENTICATE  - the SAML + TOTP login. Slow (a few seconds), consumes a
+#      one-time code, and mints a session token that stays valid for ~24h.
+#   2. CONNECT       - hand that token to openconnect to raise the tunnel. Fast
+#      (~1s) and can be repeated: the same token brings the tunnel back up
+#      without a fresh login, and even survives an unclean drop.
+# openconnect-saml normally fuses the two, re-running the whole login on every
+# reconnect. We keep the token and reconnect from it, so a dropped tunnel comes
+# back in about a second instead of a full re-auth. We only log in again when the
+# token is actually spent (rejected by the gateway, or near its 24h expiry).
+# These behaviours were established empirically against the live gateway; see
+# docs/DEVELOPMENT.md (VPN session model) for the findings behind each choice.
 set -euo pipefail
 
 : "${VPN_USERNAME:?set VPN_USERNAME in .env}"
@@ -18,6 +31,14 @@ export PROFILE_NAME="UniVPN"
 export PYTHON_KEYRING_BACKEND="keyrings.alt.file.PlaintextKeyring"
 export OPENCONNECT_SAML_CONFIG="/config/openconnect-saml/config.toml"
 mkdir -p /config/openconnect-saml
+
+# openconnect identity + wiring. The user-agent matches what openconnect-saml
+# sends so the gateway treats our direct openconnect calls identically. The
+# script wrapper installs the tunnel routes but never rewrites resolv.conf
+# (see vpnc-noresolv for why). One named interface keeps the egress rules simple.
+OC_USERAGENT="AnyConnect Linux_64 4.7.00136"
+OC_SCRIPT="/usr/local/bin/vpnc-noresolv"
+TUN_IFACE="tun0"
 
 # ── Load secrets into the keyring + write the openconnect-saml profile ──
 # Mirrors EasyUniVPN's save_profile(): username + totp_source=local in the
@@ -62,12 +83,21 @@ fi
 # second or two at container startup; without this the very first connect can die
 # with "Failed to resolve univpn.uni-graz.at" and force a restart.
 for _ in $(seq 1 30); do
-    if python3 -c "import socket,sys; socket.gethostbyname('${VPN_SERVER}')" 2>/dev/null; then
+    if python3 -c "import socket; socket.gethostbyname('${VPN_SERVER}')" 2>/dev/null; then
         break
     fi
     echo "[vpn] waiting for DNS to resolve ${VPN_SERVER}..."
     sleep 2
 done
+
+# Pin the gateway's address in /etc/hosts. We no longer let the tunnel rewrite
+# resolv.conf, so this is belt-and-suspenders: even if DNS breaks for any other
+# reason, reconnecting to the gateway never depends on a working resolver.
+gw_ip=$(python3 -c "import socket; print(socket.gethostbyname('${VPN_SERVER}'))" 2>/dev/null || true)
+if [ -n "${gw_ip}" ] && ! grep -q "[[:space:]]${VPN_SERVER}\$" /etc/hosts 2>/dev/null; then
+    echo "${gw_ip} ${VPN_SERVER}" >> /etc/hosts
+    echo "[vpn] pinned ${VPN_SERVER} -> ${gw_ip} in /etc/hosts."
+fi
 
 # ── Lock the tunnel egress to the mail service only ──
 # Over the VPN, this container may reach ONLY the mail ports (IMAPS 993 and
@@ -75,19 +105,21 @@ done
 # unreachable through the tunnel, so even a compromise of this box cannot be
 # turned into a backdoor into the wider university network. The VPN transport
 # itself (on eth0) and this container's own return traffic are unaffected. The
-# rules reference tun0 by name, so they can be installed before the interface
-# exists; they take effect once the tunnel comes up. Best effort: if iptables is
-# unavailable the proxy still only relays mail, but this extra firewall is off.
+# rules match tun+ (any tunnel interface) so they cover the active tunnel and any
+# transient second tunnel a future make-before-break refresh might raise; they
+# can be installed before the interface exists and take effect once it appears.
+# Best effort: if iptables is unavailable the proxy still only relays mail, but
+# this extra firewall is off.
 apply_egress_lock() {
     iptables -A OUTPUT -o lo -j ACCEPT &&
     iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
-    iptables -A OUTPUT ! -o tun0 -j ACCEPT &&
-    iptables -A OUTPUT -o tun0 -p tcp -m multiport --dports 993,587 -j ACCEPT &&
-    iptables -A OUTPUT -o tun0 -p udp --dport 53 -j ACCEPT &&
-    iptables -A OUTPUT -o tun0 -p tcp --dport 53 -j ACCEPT &&
-    iptables -A OUTPUT -o tun0 -j DROP &&
-    iptables -A INPUT -i tun0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
-    iptables -A INPUT -i tun0 -j DROP
+    iptables -A OUTPUT ! -o tun+ -j ACCEPT &&
+    iptables -A OUTPUT -o tun+ -p tcp -m multiport --dports 993,587 -j ACCEPT &&
+    iptables -A OUTPUT -o tun+ -p udp --dport 53 -j ACCEPT &&
+    iptables -A OUTPUT -o tun+ -p tcp --dport 53 -j ACCEPT &&
+    iptables -A OUTPUT -o tun+ -j DROP &&
+    iptables -A INPUT -i tun+ -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
+    iptables -A INPUT -i tun+ -j DROP
 }
 if apply_egress_lock 2>/tmp/egress.err; then
     echo "[vpn] tunnel egress locked: only mail (993/587) and DNS are allowed over the VPN."
@@ -113,23 +145,42 @@ start_relay 993 &   # IMAPS (implicit TLS, end-to-end)
 start_relay 587 &   # SMTP submission (STARTTLS, end-to-end)
 echo "[vpn] passthrough relays up on 993/587 (operator-blind - ciphertext only)."
 
-# ── Keep the VPN up, and refresh the session on a schedule ──
-# The university expires the VPN session about 24 hours after sign-in
-# (openconnect logs the exact time: "Session authentication will expire at ...").
-# Waiting for that hard expiry is rough: openconnect can keep retrying a dead
-# session for minutes before giving up. Instead we re-authenticate ourselves at
-# fixed local times (VPN_REFRESH_TIMES, default 03:00 and 04:00), quiet hours
-# where a ~4-second reconnect is very unlikely to disturb anyone. Using two times
-# a day (not one) keeps the largest gap under 24h with no drift, so a refresh
-# always lands before the session can hard-expire. Times are read in TZ (default
-# Europe/Berlin); set TZ to your server's zone if different. Brief network blips
-# are still absorbed by openconnect itself, with no re-auth. We run one connect
-# per loop (not openconnect-saml's own --reconnect) so we control the timing.
-# VPN_REFRESH_SECONDS is a test-only fixed-interval override.
+# ── Tuning knobs (env-overridable) ──
 export TZ="${TZ:-Europe/Berlin}"
+# Quiet-hour times at which to cycle to a fresh session token before the ~24h
+# server-side expiry. Two times a day keep the largest gap under 24h with no
+# drift. VPN_REFRESH_SECONDS is a test-only fixed-interval override.
 VPN_REFRESH_TIMES="${VPN_REFRESH_TIMES:-03:00,04:00}"
-VPN_RECONNECT_BACKOFF="${VPN_RECONNECT_BACKOFF:-35}"
-VPN_PROACTIVE_BACKOFF="${VPN_PROACTIVE_BACKOFF:-2}"
+# Dead Peer Detection interval (seconds): how often openconnect checks the peer
+# is alive, so it bounds how fast a drop is noticed. Lower is snappier but a
+# little chattier and slightly more prone to reacting to a brief latency spike.
+VPN_DPD="${VPN_DPD:-5}"
+# How long openconnect keeps trying to restore its transport in place (reusing
+# the current token) after a drop before it gives up and exits so our loop takes
+# over. openconnect's default is 300s, which stretches a blip into minutes.
+VPN_RECONNECT_TIMEOUT="${VPN_RECONNECT_TIMEOUT:-25}"
+# Re-authenticate a token before it can hard-expire. The gateway grants ~24h;
+# 20h leaves generous margin while keeping logins rare (roughly one a day beyond
+# the scheduled refreshes).
+VPN_TOKEN_MAX_AGE="${VPN_TOKEN_MAX_AGE:-72000}"
+# Settle pause before reconnecting from an existing token after a drop. This is
+# NOT a re-auth (no one-time code involved), so it can be short.
+VPN_RECONNECT_SETTLE="${VPN_RECONNECT_SETTLE:-1}"
+# Pause after a FAILED login before retrying. Kept above the 30s one-time-code
+# window so a retry never reuses a code the gateway just saw, and it doubles as
+# gentle rate-limiting against the login endpoint.
+VPN_MINT_BACKOFF="${VPN_MINT_BACKOFF:-35}"
+
+# Session-token state (held in memory only, never written to disk).
+VPN_COOKIE=""
+VPN_FP=""
+VPN_HOST=""
+TOKEN_MINTED=0
+# The gateway's TOTP codes are valid for 30s and are single-use, so two logins
+# closer than this can present the same code and be rejected. We never let a
+# re-auth start sooner than this after the previous login attempt.
+MIN_MINT_SPACING=32
+LAST_MINT=0
 
 # Seconds from now until the soonest scheduled refresh time.
 seconds_until_next_refresh() {
@@ -167,56 +218,134 @@ warn_if_schedule_unsafe() {
     return 0
 }
 
-# Kill the openconnect binary (comm is exactly "openconnect"), without procps.
+# Signal every running openconnect (comm is exactly "openconnect"), without
+# procps. Default SIGKILL (9): a hard stop sends NO logout to the gateway, so the
+# session token stays valid and we can reconnect from it. Pass 15 (SIGTERM) only
+# when we WANT openconnect to log the session out cleanly (planned refresh or
+# shutdown), i.e. when we are deliberately discarding the token.
 kill_openconnect() {
-    local d
+    local sig="${1:-9}" d
     for d in /proc/[0-9]*; do
         [ "$(cat "$d/comm" 2>/dev/null || true)" = "openconnect" ] \
-            && kill "$(basename "$d")" 2>/dev/null || true
+            && kill "-${sig}" "$(basename "$d")" 2>/dev/null || true
     done
     return 0
 }
 
-# Clean shutdown on docker stop: drop the tunnel and exit.
-trap 'kill_openconnect; exit 0' TERM INT
+# Log in once and capture the session token (COOKIE), the server-cert pin
+# (FINGERPRINT), and the gateway URL (HOST). Returns non-zero on failure.
+mint_token() {
+    local out wait_s
+    # Never present a one-time code twice: keep logins at least one code-window
+    # apart, even when a safety re-auth wants to fire right after the last one.
+    wait_s=$(( LAST_MINT + MIN_MINT_SPACING - $(date +%s) ))
+    if [ "$wait_s" -gt 0 ]; then
+        echo "[vpn] waiting ${wait_s}s before logging in again so the one-time code rolls over..."
+        sleep "$wait_s"
+    fi
+    LAST_MINT=$(date +%s)
+    echo "[vpn] authenticating (headless SAML + TOTP) to mint a ~24h session token..."
+    if ! out=$(openconnect-saml connect "${PROFILE_NAME}" --browser headless \
+                   --authenticate shell 2>/tmp/auth.err); then
+        echo "[vpn] login failed: $(tail -n1 /tmp/auth.err 2>/dev/null || true)"
+        return 1
+    fi
+    VPN_COOKIE=$(printf '%s\n' "$out" | sed -n 's/^COOKIE=//p'      | tr -d "'\"")
+    VPN_FP=$(printf     '%s\n' "$out" | sed -n 's/^FINGERPRINT=//p' | tr -d "'\"")
+    VPN_HOST=$(printf   '%s\n' "$out" | sed -n 's/^HOST=//p'        | tr -d "'\"")
+    if [ -z "$VPN_COOKIE" ] || [ -z "$VPN_FP" ] || [ -z "$VPN_HOST" ]; then
+        echo "[vpn] login produced no usable token; retrying shortly."
+        VPN_COOKIE=""
+        return 1
+    fi
+    TOKEN_MINTED=$(date +%s)
+    echo "[vpn] token minted; connecting."
+    return 0
+}
+
+# Raise the tunnel from the current token (no re-auth). Backgrounds openconnect
+# and sets oc_pid. --no-dtls forces the tunnel over TCP: DTLS/UDP is prone to
+# silent NAT-timeout drops behind a home router, which were the main source of
+# the recurring outages; TCP trades a little latency (irrelevant for mail) for a
+# connection that stays up. --cookie-on-stdin keeps the token off the argv/env.
+run_tunnel() {
+    printf '%s' "$VPN_COOKIE" | openconnect \
+        --cookie-on-stdin --servercert "$VPN_FP" --useragent "$OC_USERAGENT" \
+        --no-dtls --interface "$TUN_IFACE" --script "$OC_SCRIPT" \
+        --force-dpd "$VPN_DPD" --reconnect-timeout "$VPN_RECONNECT_TIMEOUT" \
+        "$VPN_HOST" >/tmp/oc.log 2>&1 &
+    oc_pid=$!
+}
+
+# Clean shutdown on docker stop: log the session out (SIGTERM) and exit.
+trap 'echo "[vpn] shutting down; logging the VPN session out."; kill_openconnect 15; exit 0' TERM INT
 
 warn_if_schedule_unsafe
-echo "[vpn] connecting to ${VPN_SERVER} (headless SAML + TOTP); proactive refresh at ${VPN_REFRESH_TIMES} ${TZ}."
+echo "[vpn] starting; TCP tunnel, ~1s token reconnects, proactive refresh at ${VPN_REFRESH_TIMES} ${TZ}."
+short_exits=0   # consecutive connects that died almost immediately (safety net)
 while true; do
+    # 1. Make sure we hold a fresh-enough token. Re-auth only when we have none
+    #    or the current one is near its 24h expiry.
+    now=$(date +%s)
+    if [ -z "$VPN_COOKIE" ] || [ $(( now - TOKEN_MINTED )) -ge "$VPN_TOKEN_MAX_AGE" ]; then
+        if ! mint_token; then sleep "$VPN_MINT_BACKOFF"; continue; fi
+    fi
+
+    # 2. Raise the tunnel from the token.
     rm -f /tmp/proactive_refresh
-    # --no-sudo: we are already root; openconnect creates tun0 directly
-    # (needs NET_ADMIN + /dev/net/tun).
-    openconnect-saml connect "${PROFILE_NAME}" --browser headless --no-sudo &
-    oc_saml=$!
+    conn_start=$(date +%s)
+    run_tunnel
 
-    # When to refresh: the next scheduled time, or a fixed interval in tests.
+    # 3. Proactive refresh timer: at the scheduled quiet-hour time, cleanly end
+    #    the session (SIGTERM logs it out) so the loop mints a fresh token before
+    #    the server-side hard expiry can bite during the day.
     refresh_in="${VPN_REFRESH_SECONDS:-$(seconds_until_next_refresh)}"
-    echo "[vpn] next proactive refresh: $(date -d "@$(( $(date +%s) + refresh_in ))" '+%Y-%m-%d %H:%M:%S %Z') (in ${refresh_in}s)"
-
-    # Refresh timer: at the scheduled time, end the current session so the loop
-    # re-authenticates before the server-side expiry. The flag marks it planned.
-    ( sleep "${refresh_in}"
+    echo "[vpn] tunnel up on ${TUN_IFACE}; next proactive refresh $(date -d "@$(( $(date +%s) + refresh_in ))" '+%Y-%m-%d %H:%M:%S %Z') (in ${refresh_in}s)."
+    ( sleep "$refresh_in"
       touch /tmp/proactive_refresh
-      echo "[vpn] proactive refresh: re-authenticating before the session expires"
-      kill "${oc_saml}" 2>/dev/null || true
-      kill_openconnect ) &
+      echo "[vpn] proactive refresh: cycling to a fresh session at the scheduled time."
+      kill_openconnect 15 ) &
     refresh_timer=$!
 
-    wait "${oc_saml}" 2>/dev/null || true   # blocks until it exits (drop or timer)
-    kill "${refresh_timer}" 2>/dev/null || true
-    kill_openconnect                        # make sure the tunnel is down
+    # 4. Block until the tunnel exits: a drop, the refresh timer, or a dead token.
+    wait "$oc_pid" 2>/dev/null || true
+    kill "$refresh_timer" 2>/dev/null || true
+    kill_openconnect 9   # ensure it is fully down (hard, so an unplanned drop keeps the token)
 
+    # 5. Decide how to come back.
+    held=$(( $(date +%s) - conn_start ))
     if [ -f /tmp/proactive_refresh ]; then
-        # Planned refresh: the session was at least an hour old (refreshes are
-        # spaced apart), so there is no one-time-code anti-replay risk. Reconnect
-        # right away to keep the gap tiny (about 4 seconds total).
-        backoff="${VPN_PROACTIVE_BACKOFF}"
-        echo "[vpn] reconnecting now (planned refresh, ${backoff}s settle)..."
+        # Planned refresh: deliberately discard the token and log in fresh.
+        VPN_COOKIE=""
+        short_exits=0
+        echo "[vpn] planned refresh complete; re-authenticating."
+        sleep 1
+    elif grep -qiE 'cookie was rejected|http/[0-9.]+ 401|authentication failure|session (authentication )?(has )?expired|token (is )?invalid|permission denied' /tmp/oc.log; then
+        # The gateway refused the token (spent or hard-expired): must re-auth.
+        VPN_COOKIE=""
+        short_exits=0
+        echo "[vpn] session token no longer accepted; re-authenticating. (last: $(grep -iE 'cookie was rejected|401|expired|invalid' /tmp/oc.log | tail -n1))"
+        sleep 2
+    elif [ "$held" -lt 5 ]; then
+        # The tunnel died almost at once. Likely a transient gateway/transport
+        # issue rather than a normal drop; reconnect from the token but back off
+        # so we never hot-loop. If it keeps happening the token is probably bad
+        # in a way our patterns missed, so force a fresh login as a safety net.
+        short_exits=$(( short_exits + 1 ))
+        if [ "$short_exits" -ge 3 ]; then
+            VPN_COOKIE=""
+            short_exits=0
+            echo "[vpn] repeated immediate exits; re-authenticating to be safe."
+        else
+            echo "[vpn] tunnel exited after ${held}s (${short_exits}/3); retrying from token in 5s..."
+        fi
+        sleep 5
     else
-        # Unexpected drop, which could have happened seconds after a login. Keep
-        # the backoff above the 30-second code window so no code is reused.
-        backoff="${VPN_RECONNECT_BACKOFF}"
-        echo "[vpn] VPN session ended unexpectedly; re-authenticating in ${backoff}s..."
+        # An unclean transport drop after a healthy run. The token is still
+        # valid, so reconnect from it immediately - about a one-second recovery,
+        # no login.
+        short_exits=0
+        echo "[vpn] tunnel dropped after ${held}s; reconnecting from the existing token..."
+        sleep "$VPN_RECONNECT_SETTLE"
     fi
-    sleep "${backoff}"
 done

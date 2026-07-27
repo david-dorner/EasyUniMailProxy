@@ -1,0 +1,22 @@
+#!/bin/sh
+# vpnc-script wrapper: bring up the tunnel's ROUTES but never touch DNS.
+#
+# The stock vpnc-script rewrites /etc/resolv.conf to the DNS servers the gateway
+# pushes (the uni-internal resolvers, reachable only THROUGH the tunnel). That is
+# actively harmful here for two reasons:
+#
+#   1. If the tunnel dies uncleanly, vpnc-script's teardown never runs, so
+#      /etc/resolv.conf is left pointing at resolvers that are now unreachable.
+#      The next reconnect then cannot even resolve the gateway hostname, turning
+#      a one-second blip into a long outage. (Verified in testing.)
+#   2. We do not need the uni resolvers at all: email.uni-graz.at resolves on
+#      public DNS to an address that is inside the tunnel's route range, so the
+#      relay reaches it over the tunnel regardless of which resolver named it.
+#
+# vpnc-script only edits resolv.conf when INTERNAL_IP4_DNS is non-empty (see its
+# `if [ -n "$INTERNAL_IP4_DNS" ]` guard), so clearing these variables makes it
+# skip DNS entirely while still installing the split-tunnel routes we rely on.
+unset INTERNAL_IP4_DNS
+unset INTERNAL_IP6_DNS
+unset CISCO_DEF_DOMAIN
+exec /usr/share/vpnc-scripts/vpnc-script "$@"
