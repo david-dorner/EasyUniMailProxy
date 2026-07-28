@@ -65,8 +65,15 @@ import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-TARGET_HOST = os.environ.get("WATCHDOG_TARGET_HOST", "vpn")
+# Primary target = the client-facing mail server (Dovecot). If it is down,
+# clients cannot connect at all: that is the outage the uptime stats track.
+TARGET_HOST = os.environ.get("WATCHDOG_TARGET_HOST", "mail")
 TARGET_PORT = int(os.environ.get("WATCHDOG_TARGET_PORT", "993"))
+# Upstream target = the tunnel/relay to the university (the sync + send path). If
+# it is down while the mail server is up, cached mail still serves but syncing
+# and sending are paused; we flag that separately, at a lower priority.
+UPSTREAM_HOST = os.environ.get("WATCHDOG_UPSTREAM_HOST", "").strip()
+UPSTREAM_PORT = int(os.environ.get("WATCHDOG_UPSTREAM_PORT", "993"))
 INTERVAL = int(os.environ.get("WATCHDOG_INTERVAL", "60"))
 FAIL_INTERVAL = int(os.environ.get("WATCHDOG_FAIL_INTERVAL", "5"))
 FAIL_THRESHOLD = int(os.environ.get("WATCHDOG_FAIL_THRESHOLD", "3"))
@@ -115,11 +122,11 @@ def fmt_dur(seconds: float) -> str:
     return f"{s // 3600}h{(s % 3600) // 60:02d}m"
 
 
-def probe() -> tuple[bool, str, float]:
-    """Return (healthy, detail, latency_ms). Healthy = IMAP greeting through the path."""
+def probe(host: str = TARGET_HOST, port: int = TARGET_PORT) -> tuple[bool, str, float]:
+    """Return (healthy, detail, latency_ms). Healthy = an IMAP greeting on host:port."""
     t0 = time.monotonic()
     try:
-        with socket.create_connection((TARGET_HOST, TARGET_PORT), timeout=10) as raw:
+        with socket.create_connection((host, port), timeout=10) as raw:
             with _TLS.wrap_socket(raw, server_hostname="email.uni-graz.at") as s:
                 s.settimeout(8)
                 banner = s.recv(64)
@@ -411,6 +418,7 @@ def main():
     warned_never_up = False
     last_log_summary = time.monotonic()
     last_summary_day = day_key(now())
+    upstream_state = None  # None/True/False: reachability of the university path
 
     # If we resume mid-outage (watchdog restarted while the path was down), carry
     # that forward so the outage is one continuous record, not two.
@@ -456,6 +464,28 @@ def main():
                 warned_never_up = True
 
         stats.save(healthy, detail, latency)
+
+        # Secondary: the upstream path to the university (tunnel/relay). If it is
+        # down while the mail server itself is up, cached mail still opens but
+        # syncing and sending are paused - flag that at a lower priority. (When the
+        # mail server is also down, the DOWN alert above already covers it.)
+        if UPSTREAM_HOST:
+            up_ok, up_detail, _ = probe(UPSTREAM_HOST, UPSTREAM_PORT)
+            if not up_ok and upstream_state is not False and healthy:
+                notify("EasyUniMailProxy upstream down",
+                       "Cannot reach the university (tunnel/relay). Cached mail still "
+                       "opens, but new mail and sending are paused until it recovers.\n"
+                       f"{up_detail}", "default", "warning")
+                log(f"upstream down: {up_detail}")
+                upstream_state = False
+            elif up_ok and upstream_state is False:
+                notify("EasyUniMailProxy upstream restored",
+                       "The connection to the university is back; sync and send resume.",
+                       "default", "arrows_counterclockwise")
+                log("upstream restored")
+                upstream_state = True
+            elif up_ok:
+                upstream_state = True
 
         # Periodic uptime line to the container log (no ntfy) for at-a-glance data.
         if LOG_SUMMARY_EVERY and time.monotonic() - last_log_summary >= LOG_SUMMARY_EVERY:

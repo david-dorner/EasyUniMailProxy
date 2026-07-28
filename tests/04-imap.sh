@@ -2,7 +2,7 @@
 # folder discovery (special-use flags) + IDLE. One probe, several assertions.
 ensure_up >/dev/null 2>&1 || true
 
-IMAP_OUT="$(probe imap.py 2>&1)"; IMAP_RC=$?
+IMAP_OUT="$(mail_probe imap.py 2>&1)"; IMAP_RC=$?
 
 describe "imap: native experience"
 

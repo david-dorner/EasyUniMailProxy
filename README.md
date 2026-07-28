@@ -1,59 +1,46 @@
 # EasyUniMailProxy
 
-**Use your University of Graz email on any device, without ever putting the VPN
-on that device.**
+**Use your University of Graz email on any device, without ever putting the VPN on that device, and with no certificate warnings anywhere.**
 
-EasyUniMailProxy is a small self-hosted service that runs on an always-on Linux
-box (a home server, a VPS, a Raspberry Pi). It keeps one permanent connection to
-the University of Graz VPN and exposes the university mail server as an ordinary
-IMAP/SMTP endpoint. You point Thunderbird, or any mail app on any device, at
-your box and log in with your normal university credentials. Everything you get
-natively over the VPN (instant push, Trash/Sent/Junk discovery, server-side
-search) you get here too, because your client is talking to the real server
-through the tunnel.
+EasyUniMailProxy is a small self-hosted mail server that runs on an always-on Linux box (a home server, a VPS, a Raspberry Pi). It keeps one permanent connection to the University of Graz VPN, syncs your university mailbox into a local mailbox, and serves it as an ordinary IMAP/SMTP endpoint behind its **own trusted certificate**. You point Thunderbird, or any mail app on any device, at your box and log in with your normal university credentials.
 
-Crucially, the box **cannot read your mail or your password**: your client's TLS
-runs end to end to the real server, and the service only forwards ciphertext.
-That is what makes it safe to share with a few other people.
+It is a sister project to [EasyUniVPN](https://github.com/david-dorner/EasyUniVPN) and reuses its headless VPN sign-in (SAML plus password plus one-time code, no browser).
 
-It is a sister project to
-[EasyUniVPN](https://github.com/david-dorner/EasyUniVPN) and reuses its headless
-VPN sign-in (SAML plus password plus one-time code, no browser).
-
-> **Unofficial software.** EasyUniMailProxy is an independent project. It is
-> **not affiliated with, endorsed by, or supported by the University of Graz**.
-> If it breaks, ask here (GitHub issues), not the university's IT support. You
-> are responsible for using it in line with your university's acceptable-use
-> policy. Use at your own risk.
+> **Unofficial software.** EasyUniMailProxy is an independent project. It is **not affiliated with, endorsed by, or supported by the University of Graz**. If it breaks, ask here (GitHub issues), not the university's IT support. You are responsible for using it in line with your university's acceptable-use policy. Use at your own risk.
 
 ---
 
 ## How it works
 
-```
-Your phone / laptop   ---- IMAPS 993, SMTP 587 (TLS end to end) ---->   [ your box ]   ---->   real Exchange
-     (no VPN)                                                          VPN tunnel + relay      (email.uni-graz.at)
-```
-
 - One **carrier** university account (in `.env`) keeps the VPN tunnel up.
-- Every user logs into **their own** mailbox through it, with their own password.
-- No mail and no user passwords are stored on the box; it only forwards bytes.
-- If the tunnel drops it reconnects from the existing session in about a second,
-  and a monitor tracks uptime and alerts you (over the normal internet) on any
-  sustained outage.
+- Each user's university mailbox is **synced into a local mailbox** and served by Dovecot, so reading is instant and works offline; new mail is prefetched.
+- Outgoing mail is **queued and relayed** to the university as the sender, and retried until it lands, so sending survives a disconnect or a brief outage.
 
 For the full design, see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ---
 
+## The security model
+
+The box **terminates your TLS** with its own certificate. That means the box does handle your mail and your password - **it is not "operator-blind" like the old 1.x passthrough was.** Whoever runs the box is technically capable of accessing the mail and passwords it holds.
+
+What the design does to make that as hard as practical:
+
+- **Passwords are never stored in plaintext.** Your university password is used to log in, then encrypted (AES) at rest and only decrypted, into memory, for the moment it is needed to sync or send.
+- **Cached mail is encrypted at rest.** All mailboxes live on an encrypted (gocryptfs) filesystem, so the disk/volume holds only ciphertext.
+- **The key can be bound to the machine.** Both of the above are keyed by a master key that exists only in memory at runtime and can be sealed to the machine's TPM, so it is not sitting on the disk in the clear.
+
+The boundary: a determined operator, or an attacker who gains root, could still read live traffic from memory or run a modified container. This is not mathematically impossible - it is made **hard, not impossible**. Nothing sensitive is plaintext on disk, the password's plaintext lifetime is minimal, and the key can be TPM-bound. **Share the box only with people who accept that you, as the operator, are technically capable of accessing their mail** - even though the design works hard to prevent it.
+
+(If you need a design where the operator genuinely *cannot* read anything, that is the 1.x passthrough - but it comes with the certificate warning, which does not work on all mobile clients.)
+
+---
+
 ## Requirements
 
-- A Linux host (or WSL) with **Docker** and **Docker Compose**, and
-  `/dev/net/tun` available (standard on any normal Linux host).
-- One university account whose credentials and TOTP secret go in `.env` (the
-  carrier). Getting the TOTP secret is a one-time step, described in the
-  EasyUniVPN README under "Getting your TOTP secret"; it is the `secret=` value
-  inside your authenticator's QR code.
+- A Linux host with **Docker** and **Docker Compose**, with `/dev/net/tun` (for the VPN) and `/dev/fuse` (for the encrypted mail store) available. Both are standard on a normal Linux host. WSL2 should also work on Windows.
+- One university account whose credentials and TOTP secret go in `.env` (the carrier). Getting the TOTP secret is a one-time step, described in the EasyUniVPN README under "Getting your TOTP secret".
+- A **hostname you control** that points at the box, for the certificate (for example a subdomain on a domain you own).
 - An [ntfy](https://ntfy.sh) topic for watchdog alerts (free, no account).
 
 ---
@@ -64,214 +51,92 @@ For the full design, see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 git clone https://github.com/david-dorner/EasyUniMailProxy.git
 cd EasyUniMailProxy
 cp .env.example .env
-# edit .env: the carrier VPN account, and a long secret ntfy topic
+# edit .env (see below), then:
 docker compose up -d
-docker compose logs -f vpn        # watch the tunnel authenticate and come up
+docker compose logs -f mail
 ```
 
-When `docker compose ps` shows the `vpn` container healthy, the proxy is ready.
-Subscribe to your `NTFY_URL` topic in the ntfy app; you will get an "online"
-ping, and later any DOWN or RECOVERED alerts.
+In `.env` you set:
 
-To verify everything end to end, run the test suite in [tests/](tests/):
+- **The carrier VPN account** - `VPN_USERNAME`, `VPN_PASSWORD`, `VPN_TOTP_SECRET`.
+- **The certificate** - `MAIL_HOSTNAME` (the name your clients connect to) and `CERT_MODE`:
+  - `cloudflare-dns` (recommended): Let's Encrypt via the Cloudflare DNS-01 challenge. Free, auto-renewing, trusted everywhere, works behind NAT. Needs a scoped `CF_DNS_API_TOKEN` and `ACME_EMAIL`.
+  - `http-01`: Let's Encrypt via HTTP-01 (needs inbound port 80).
+  - `manual`: supply your own certificate (`CERT_FILE`, `CERT_KEY`).
+  - `selfsigned`: for LAN/testing only (clients will warn).
+- **The at-rest key** - `KEY_MODE` (default `auto`: use the TPM if the machine has one, otherwise generate and store a strong key).
+- **The ntfy topic** - `NTFY_URL` (and optional `NTFY_TOKEN`).
 
-```bash
-cd tests && ./run-tests.sh
-```
-
----
-
-## Example deployment
-
-The box needs to be reachable from your devices, and the mail ports should be
-open only to people you trust. There are a few options for this:
-
-- **Same network only.** If your devices and the server are on the same home
-  or office network (LAN), point your mail client at the server's local address
-  (for example `192.168.1.10`). Nothing is exposed to the internet. This is the
-  simplest and safest option.
-- **Private overlay VPN.** Put the server and your
-  devices on a mesh VPN such as Tailscale or WireGuard, and point your mail
-  client at the server's overlay address. The mail ports never touch the public
-  internet, and only devices on your overlay can reach them. This is a different
-  VPN from the university one; it only connects your own devices to your own
-  server, so your devices still need no university VPN.
-- **Port forwarding plus a hostname.** On your router, forward external ports
-  993 and 587 to the server. If your home IP address changes over time, give the
-  server a stable name with a dynamic-DNS provider (DDNS) and point your mail
-  client at that hostname. If you expose the ports this way, firewall them to the
-  source addresses you expect so they are not open to the whole internet (see
-  Security below).
-
-Whichever you choose:
-
-1. Set `BIND_ADDR` in `.env` to the interface the ports should listen on (for
-   example the overlay or LAN address, or `0.0.0.0` when it sits behind a
-   firewall).
-2. Make sure the server itself can always reach the internet, for the VPN.
-3. Point every mail client at that address, using the settings in the next
-   section.
-
----
-
-## Alternative: run it on your own machine
-
-You do not strictly need a separate server. If you just want constant mail access
-on one computer, without putting the VPN into your mail client, you can run the
-whole stack locally and point your mail app at `localhost`:
-
-- **Linux:** run it natively.
-- **Windows:** run it inside WSL2 (Docker Desktop with the WSL2 backend, or Docker
-  inside a WSL2 distribution).
-- **macOS:** run it under Docker Desktop.
-
-Set `BIND_ADDR=127.0.0.1` in `.env` so the mail ports listen only on the loopback
-interface (nothing is exposed to the network), then configure your mail client
-with server `127.0.0.1` and ports 993 and 587, as in the next section.
-
-Two notes. The tunnel and relays only run while that machine is on and the
-containers are up, so this gives you access on that one machine rather than
-everywhere. And on your own machine you can make the certificate prompt disappear
-cleanly: add `127.0.0.1 email.uni-graz.at` to your hosts file (`/etc/hosts` on
-Linux and macOS, `C:\Windows\System32\drivers\etc\hosts` on Windows) and set the
-mail server to `email.uni-graz.at`. Your client then dials that name, the
-passthrough presents the real matching certificate, and there is no warning. The
-container is unaffected, because it resolves the real server itself in its own
-network namespace, independent of your hosts file.
+**DNS:** point `MAIL_HOSTNAME` at your box. A simple way is a CNAME to a name that already tracks your IP (for example a dynamic-DNS record). If you use Cloudflare, keep the record **"DNS only" (grey cloud)** - the proxy only handles web traffic and would break IMAP/SMTP.
 
 ---
 
 ## Mail client settings
 
-Use your normal university settings, and change only the **server** to your box.
+Use your normal university settings, and change only the **server** to your box. There is **no certificate warning to accept** - the box presents a real, trusted certificate for `MAIL_HOSTNAME`.
 
 **Incoming (IMAP)**
 
 | Field | Value |
 |---|---|
-| Server | your box's hostname or IP |
+| Server | your `MAIL_HOSTNAME` (e.g. `mail.example.com`) |
 | Port | `993` |
 | Security | SSL/TLS |
-| Username | `bzedvz\your.name@edu.uni-graz.at` |
+| Username | `bzedvz\your.name@edu.uni-graz.at` *or* the plain `your.name@edu.uni-graz.at` |
 | Password | your university password |
 
 **Outgoing (SMTP)**
 
 | Field | Value |
 |---|---|
-| Server | your box's hostname or IP |
+| Server | your `MAIL_HOSTNAME` |
 | Port | `587` |
 | Security | STARTTLS |
-| Username | `bzedvz\your.name@edu.uni-graz.at` |
+| Username | same as incoming |
 | Password | your university password |
 
-**The certificate prompt is expected and correct.** Because the box never
-decrypts your traffic, your client is shown the **university's own certificate**
-(`email.uni-graz.at`) rather than one for your box's hostname. On the first
-connection your client asks you to confirm it; accept it once. You are
-confirming the genuine university certificate, and this is exactly what
-guarantees that even the server's owner cannot silently read your mail.
+The **first time** you log in, the box verifies your credentials against the real university and enrolls you; your mailbox then starts syncing (it may take a moment to fill on the first sync). After that, logins are checked locally and mail is instant.
 
 ---
 
-## Adding more users
+## Reaching the box from your devices
 
-There is nothing to configure. Anyone with a university mailbox uses the
-settings above with their own username and password. The carrier account only
-provides the network path; each mailbox is authenticated directly against the
-real server, end to end, so the operator never sees another user's password or
-mail.
+The box needs to be reachable from your devices, and the mail ports should be open only to people you trust:
+
+- **Same network (LAN):** point your mail client at the box's local address.
+- **Private overlay VPN (WireGuard, Tailscale):** put the box and your devices on a mesh network and use the overlay address. This is a different VPN from the university one; it only connects your own devices to your own box.
+- **Port forwarding plus a hostname:** forward external 993 and 587 to the box and use `MAIL_HOSTNAME`. Firewall the ports to the sources you expect. Set `BIND_ADDR` in `.env` accordingly.
+
+You can also **run it on your own machine** (WSL2 on Windows, natively on Linux, Docker Desktop on macOS) with `BIND_ADDR=127.0.0.1`, and point your mail client at `localhost` - for constant access on one computer with no separate server.
 
 ---
 
-## Security
+## Security notes
 
-- **The operator cannot read users' mail or credentials.** TLS is end to end to
-  the real server; the box forwards ciphertext only. The most anyone with access
-  to the box can see is connection metadata (which addresses connect, when, and
-  how many bytes).
-- **The box cannot be used as a backdoor into the university.** Through the proxy
-  a client can only ever reach the mail server's IMAP/SMTP ports, and the mail
-  server requires valid credentials, so no one without a mail account can do
-  anything. On top of that, the box firewalls its own VPN tunnel down to the
-  mail ports only, so even if the box itself were compromised it still could not
-  reach any other university host, port, or service.
-- **Firewall the mail ports.** Ports `993` and `587` are an authentication
-  surface. Only let trusted clients reach them: put the box on a private overlay
-  network (WireGuard, Tailscale) or restrict the ports to known addresses, and
-  do not expose them to the open internet. Set `BIND_ADDR` in `.env` to bind to
-  a private interface. Full guidance is in
-  [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
-- **Watchdog alerts and statistics.** A monitor probes the whole mail path every
-  minute (and every few seconds during a failure, to time it precisely) and sends
-  an ntfy alert, carrying the current uptime, if the VPN or relay goes down and
-  again when it recovers. Alerts travel over the normal internet, so they reach
-  you even while the VPN is broken. It also keeps durable, size-bounded uptime and
-  per-outage statistics (24h / 7d / 30d / all-time, and each outage's duration,
-  cause, and shape) you can inspect. See
-  [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
-- The carrier VPN password lives in `.env`, which is the operator's own
-  credential, not any user's. Keep the host secured accordingly.
+- **Everything persisted is encrypted at rest** (mail store via gocryptfs, passwords via AES), keyed by a master key that is held only in memory and can be sealed to the TPM.
+- **The box cannot be used as a backdoor into the university.** Over the VPN it can reach only the mail server's ports; the tunnel egress is firewalled to the mail ports and DNS, so even a compromise of the box cannot reach other university services.
+- **Firewall the mail ports (993, 587).** They are an authentication surface; only let trusted clients reach them (private overlay, or restrict to known addresses). Set `BIND_ADDR` to a private interface. Full guidance in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+- **Watchdog alerts.** A monitor probes the client-facing mail server every minute and alerts (via ntfy, over the normal internet) on an outage or recovery, with your uptime figures. It separately flags when the university path (sync/send) is unreachable.
 
 ---
 
 ## Troubleshooting
 
-Check `docker compose logs -f vpn` and `docker compose logs -f watchdog`, or run
-the test suite in [tests/](tests/).
+Check `docker compose logs -f mail`, `docker compose logs -f vpn`, and `docker compose logs -f watchdog`.
 
-- **The VPN will not authenticate.** Check `VPN_USERNAME` (the plain email, with
-  no `bzedvz\` prefix), `VPN_PASSWORD`, and `VPN_TOTP_SECRET` (the bare base32
-  secret). Confirm the credentials without opening the tunnel with
-  `docker compose run --rm -e AUTH_ONLY=1 vpn`.
-- **The tunnel is up but mail will not connect.** Check
-  `docker compose logs watchdog`; the whole path is probed there.
-- **A certificate warning appears in the client.** This is expected; accept the
-  `email.uni-graz.at` certificate once (see above).
-- **Checking uptime or past outages.** The watchdog keeps statistics in its
-  volume; read them with `docker compose exec watchdog cat /data/state.json` (or
-  `/data/outages.jsonl`). See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+- **The VPN will not authenticate.** Check the carrier `VPN_USERNAME` (plain email), `VPN_PASSWORD`, and `VPN_TOTP_SECRET`. Confirm them without opening the tunnel: `docker compose run --rm -e AUTH_ONLY=1 vpn`.
+- **The certificate does not issue.** For `cloudflare-dns`, check the API token has DNS edit permission on your zone and that `MAIL_HOSTNAME` / `ACME_EMAIL` are set. You can dry-run against Let's Encrypt staging with `ACME_STAGING=1`.
+- **A mailbox is empty at first.** The first sync can take a moment to fill; watch `docker compose logs -f mail` for the sync lines.
+- **Checking uptime or outages.** The watchdog keeps statistics in its volume: `docker compose exec watchdog cat /data/state.json`.
 
 ---
 
-## Versioning
+## Versioning and updating
 
-There is nothing separate to build: `docker compose up -d` builds the images
-locally on the host. Versioning exists only to track changes and to let you see
-when a newer release is available. The `VERSION` file and the top entry of
-[CHANGELOG.md](CHANGELOG.md) carry the current version, and a GitHub release is
-published for each version (bump `VERSION`, add a `## x.y.z` section to the
-changelog, and push to `main`). To update an existing deployment, pull the
-latest and run `docker compose up -d --build`.
-
-## Testing
-
-The integration suite (functionality, reliability failsafes, and ntfy alert
-delivery) lives in [tests/](tests/):
-
-```bash
-cd tests && ./run-tests.sh
-```
-
-## Privacy and security
-
-- User mail and passwords are never decrypted or stored on the box; the service
-  forwards ciphertext only.
-- The only secret the box holds is the carrier VPN account, which is the
-  operator's own.
-- There is no analytics, telemetry, or phone-home of any kind. The watchdog
-  contacts only the ntfy topic you configure.
+`docker compose up -d` builds the images locally; there is nothing separate to publish. The `VERSION` file and the top of [CHANGELOG.md](CHANGELOG.md) carry the current version, and a GitHub release is published for each version. To update a deployment: `git pull` then `docker compose up -d --build`.
 
 ## License
 
-EasyUniMailProxy is free software, licensed under the
-[GNU General Public License v3.0 or later](LICENSE). `vpn/headless.py` is a
-modified copy of a file from
-[openconnect-saml](https://github.com/mschabhuettl/openconnect-saml)
-(GPL-3.0-or-later). It builds on
-[OpenConnect](https://www.infradead.org/openconnect/) and
-[socat](http://www.dest-unreach.org/socat/). See
-[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for all attributions.
+EasyUniMailProxy is free software, licensed under the [GNU General Public License v3.0 or later](LICENSE). `vpn/headless.py` is a modified copy of a file from [openconnect-saml](https://github.com/mschabhuettl/openconnect-saml) (GPL-3.0-or-later). It builds on [OpenConnect](https://www.infradead.org/openconnect/), [Dovecot](https://www.dovecot.org/), [Postfix](http://www.postfix.org/), [isync/mbsync](https://isync.sourceforge.io/), [gocryptfs](https://nuetzlich.net/gocryptfs/), and [lego](https://go-acme.github.io/lego/). See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for all attributions.
 
-*"University of Graz", "uniLOGIN", and "Microsoft Exchange" are trademarks of
-their respective owners and are used here only to describe compatibility.*
+*"University of Graz", "uniLOGIN", and "Microsoft Exchange" are trademarks of their respective owners and are used here only to describe compatibility.*

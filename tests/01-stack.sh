@@ -10,6 +10,9 @@ _vpn_healthy() {
 }
 it "the vpn container is running and healthy" _vpn_healthy
 
+_mail_running() { assert_eq "$(container_status eump-mail)" "running"; }
+it "the mail container (client-facing server) is running" _mail_running
+
 _watchdog_running() { assert_eq "$(container_status eump-watchdog)" "running"; }
 it "the watchdog container is running" _watchdog_running
 

@@ -3,7 +3,7 @@
 # Sends one message to the carrier's own address. Skip with --skip-sendmail.
 ensure_up >/dev/null 2>&1 || true
 
-FLOW_OUT="$(probe mailflow.py 2>&1)"; FLOW_RC=$?
+FLOW_OUT="$(mail_probe mailflow.py 2>&1)"; FLOW_RC=$?
 
 describe "mail flow: end-to-end send + receive"
 

@@ -1,10 +1,6 @@
 # Third-Party Notices
 
-EasyUniMailProxy is licensed under the GNU General Public License v3.0 or later
-(see [LICENSE](LICENSE)). Its container images install the third-party
-components listed below from their official distribution points at build time.
-Each component remains under its own license; the license texts are available
-at the linked upstream sources.
+EasyUniMailProxy is licensed under the GNU General Public License v3.0 or later (see [LICENSE](LICENSE)). Its container images install the third-party components listed below from their official distribution points at build time. Each component remains under its own license; the license texts are available at the linked upstream sources.
 
 ## Modified third-party source in this repository
 
@@ -43,6 +39,35 @@ at the linked upstream sources.
 | lxml, PySocks | BSD |
 | pyxdg | LGPL-2.1 |
 
+## Base image (mail container)
+
+| Component | License | Source |
+|---|---|---|
+| Debian 12 "bookworm" (`debian:12-slim`) | Debian packages under their own licenses | <https://hub.docker.com/_/debian> |
+
+## System packages installed in the mail image (Debian apt)
+
+| Component | License | Source |
+|---|---|---|
+| Dovecot (`dovecot-core`, `dovecot-imapd`) | LGPL-2.1 and MIT (parts) | <https://www.dovecot.org/> |
+| Postfix (`postfix`) | IBM Public License 1.0 / Eclipse Public License 2.0 | <http://www.postfix.org/> |
+| isync / mbsync (`isync`) | GPL-2.0-or-later | <https://isync.sourceforge.io/> |
+| gocryptfs (`gocryptfs`) | MIT | <https://nuetzlich.net/gocryptfs/> |
+| libfuse / fuse3 (`fuse3`) | LGPL-2.1 (library), GPL-2.0 (utilities) | <https://github.com/libfuse/libfuse> |
+| tpm2-tools | BSD-3-Clause | <https://github.com/tpm2-software/tpm2-tools> |
+| OpenSSL (`openssl`) | Apache-2.0 | <https://www.openssl.org/> |
+| curl | curl license (MIT-style) | <https://curl.se/> |
+| ca-certificates (Mozilla CA bundle) | MPL-2.0 | <https://packages.debian.org/ca-certificates> |
+| bash | GPL-3.0-or-later | <https://www.gnu.org/software/bash/> |
+| Python 3 (`python3`) | PSF-2.0 | <https://www.python.org/> |
+| python3-cryptography | Apache-2.0 or BSD-3-Clause | <https://cryptography.io/> |
+
+## Downloaded binaries (mail image)
+
+| Component | License | Source |
+|---|---|---|
+| lego (ACME / Let's Encrypt client) | MIT | <https://github.com/go-acme/lego> |
+
 ## External services (not redistributed)
 
 | Service | Notes |
@@ -51,7 +76,4 @@ at the linked upstream sources.
 
 ## Trademarks
 
-"University of Graz", "uniLOGIN", "Cisco", "AnyConnect", "Microsoft Exchange",
-and "Keycloak" are trademarks of their respective owners. EasyUniMailProxy is an
-independent project and is not affiliated with, endorsed by, or supported by any
-of them.
+"University of Graz", "uniLOGIN", "Cisco", "AnyConnect", "Microsoft Exchange", and "Keycloak" are trademarks of their respective owners. EasyUniMailProxy is an independent project and is not affiliated with, endorsed by, or supported by any of them.

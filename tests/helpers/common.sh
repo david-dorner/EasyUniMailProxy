@@ -70,6 +70,14 @@ probe() {
     compose exec -T vpn python3 - "$@" < "$f"
 }
 
+# mail_probe <file.py> [argv...] - run a probe in the mail container (the
+# client-facing server clients actually connect to). Used by the 2.0 functional
+# suites, which exercise the local mailbox (enroll, sync, send).
+mail_probe() {
+    local f="$LIB_DIR/$1"; shift
+    compose exec -T mail python3 - "$@" < "$f"
+}
+
 container_field()    { docker inspect --format "$2" "$1" 2>/dev/null; }
 container_status()   { container_field "$1" '{{.State.Status}}'; }
 container_health()   { container_field "$1" '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}'; }

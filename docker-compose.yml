@@ -13,10 +13,19 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     env_file: .env
-    # Keep BIND_ADDR firewalled to trusted clients (README -> Security).
-    ports:
-      - "${BIND_ADDR:-0.0.0.0}:993:993"   # IMAPS (implicit TLS, end-to-end)
-      - "${BIND_ADDR:-0.0.0.0}:587:587"   # SMTP submission (STARTTLS, end-to-end)
+    # In 2.0 the vpn container is internal only: it keeps the tunnel up and
+    # exposes the university mail server to the other containers on the compose
+    # network as vpn:993 / vpn:587 (still raw passthrough, so this leg stays
+    # end to end encrypted to the university). The client-facing ports are
+    # published by the mail container instead, so nothing is published here.
+    expose:
+      - "993"
+      - "587"
+    networks:
+      eump:
+        # Stable address so the mail container can point email.uni-graz.at at the
+        # relay here (its cert then validates on the sync/enrollment leg).
+        ipv4_address: 172.28.0.2
     volumes:
       - vpn-config:/config
     healthcheck:
@@ -26,6 +35,55 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
+
+  # ── The client-facing mail server (2.0). Terminates the client's TLS with our
+  #    own certificate (no hostname-mismatch warning on any device), serves local
+  #    per-user mailboxes, and (later phases) syncs them from the university and
+  #    queues outbound mail. This is what mail clients connect to. ──
+  mail:
+    build: ./mail
+    container_name: eump-mail
+    restart: unless-stopped
+    depends_on:
+      vpn:
+        condition: service_started
+    env_file: .env
+    environment:
+      MAIL_HOSTNAME: "${MAIL_HOSTNAME:?set MAIL_HOSTNAME in .env}"
+      CERT_MODE: "${CERT_MODE:-selfsigned}"
+      KEY_MODE: "${KEY_MODE:-auto}"
+      SYNC_MODE: "${SYNC_MODE:-All}"          # mbsync: All (two-way) | Pull | Push
+      SYNC_INTERVAL: "${SYNC_INTERVAL:-60}"   # seconds between mailbox syncs
+    networks:
+      - eump
+    # Reach the university through the vpn container's relay under the uni's real
+    # name, so the certificate (CN=email.uni-graz.at) validates on the sync and
+    # enrollment leg. Only the mail container gets this mapping; the vpn container
+    # still resolves the uni normally, so its relay does not loop back on itself.
+    extra_hosts:
+      - "email.uni-graz.at:172.28.0.2"
+    # Keep BIND_ADDR firewalled to trusted clients (README -> Security).
+    ports:
+      - "${BIND_ADDR:-0.0.0.0}:993:993"   # IMAPS, own certificate
+      - "${BIND_ADDR:-0.0.0.0}:587:587"   # SMTP submission (STARTTLS), own certificate
+    volumes:
+      - mail-certs:/certs                 # TLS certificate + key
+      - mail-data:/mnt/cipher             # ENCRYPTED mail store (ciphertext on disk)
+      - mail-keys:/keys                   # master key material or TPM sealed blob
+    tmpfs:
+      - /run/mail:mode=0700               # live master key: RAM only, never on disk
+    # The mail store is encrypted at rest with gocryptfs (keyed by the master
+    # key); mounting that FUSE filesystem needs the device + capability below.
+    devices:
+      - /dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    # For KEY_MODE=tpm (or auto on a machine that has a TPM), also pass the TPM
+    # device so the master key can be sealed to it:
+    #devices:
+    #  - /dev/tpmrm0:/dev/tpmrm0
 
   # ── Watches the whole mail path; alerts via ntfy on breakage. ──
   # Runs in its OWN namespace so it survives a vpn-container failure and can
@@ -37,18 +95,32 @@ services:
     depends_on:
       vpn:
         condition: service_started
+      mail:
+        condition: service_started
     environment:
-      WATCHDOG_TARGET_HOST: vpn      # reach the relay via the compose network
+      WATCHDOG_TARGET_HOST: mail     # the client-facing mail server (Dovecot)
       WATCHDOG_TARGET_PORT: "993"
+      WATCHDOG_UPSTREAM_HOST: vpn    # the tunnel/relay = the sync + send path
       WATCHDOG_INTERVAL: "60"        # probe every 60s while healthy
       WATCHDOG_FAIL_INTERVAL: "5"    # probe every 5s during a failure (time the outage)
       WATCHDOG_FAIL_THRESHOLD: "3"   # DOWN alert after 3 consecutive failures
       WATCHDOG_STATS_DIR: /data      # uptime + outage stats live here (persisted)
       NTFY_URL: "${NTFY_URL:-}"
       NTFY_TOKEN: "${NTFY_TOKEN:-}"
+    networks:
+      - eump
     volumes:
       - watchdog-stats:/data         # keep statistics across restarts
 
+networks:
+  eump:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
 volumes:
   vpn-config:
+  mail-certs:
+  mail-data:
+  mail-keys:
   watchdog-stats:
