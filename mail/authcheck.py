@@ -26,7 +26,12 @@ change discards it together with the mail):
     last_uni    epoch of the last university verification attempt (cooldown)
 """
 import base64
-import crypt
+import warnings
+with warnings.catch_warnings():
+    # crypt is deprecated in 3.13 but present and fine on the image's Python 3.11;
+    # silence the noisy warning so Dovecot does not log it as an auth error.
+    warnings.simplefilter("ignore", DeprecationWarning)
+    import crypt
 import hashlib
 import hmac
 import imaplib
@@ -119,6 +124,23 @@ def enroll(email: str, password: str):
     for path in [d, mbox] + [os.path.join(d, f) for f in os.listdir(d)]:
         _own_by_mail(path)
     log(f"enrolled {email}")
+
+
+def deauth(email: str):
+    """Drop a user's stored credentials after the university rejects them (the
+    user changed their university password). The stale password then stops passing
+    the fast local check, so the client's old password fails, the client prompts
+    for the new one, and entering it re-verifies against the university and
+    re-enrolls - the same experience as a normal account whose password changed.
+    The cached mail is left untouched. Safe if it fires on a false alarm: the
+    client simply re-authenticates with its still-valid password and re-enrolls."""
+    d = creds_dir(email)
+    for name in ("passhash", "upass.enc", "last_uni"):
+        try:
+            os.remove(os.path.join(d, name))
+        except OSError:
+            pass
+    log(f"de-enrolled {email}: university rejected the stored password; the client must re-enter it")
 
 
 def _write(path: str, data: bytes):

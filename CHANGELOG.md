@@ -2,6 +2,17 @@
 
 All notable changes to EasyUniMailProxy are documented here. The version number of the latest entry must match the `VERSION` file; the release workflow reads both to publish a GitHub release automatically.
 
+## 2.0.2 - 2026-07-29
+
+Near-instant mail, automatic folders, and native password-change handling. No configuration changes; upgrade with `git pull` then `docker compose up -d --build`.
+
+- Near-instant new mail: the box now holds an IMAP IDLE connection to each user's university INBOX, so a new message is pulled into the local mailbox within a couple of seconds and pushed straight on to the client, instead of waiting for the poll. The periodic sync stays as a safety net and to keep other folders current. If a server does not support IDLE, it falls back to polling.
+- Folders appear on their own: every synced folder is subscribed for the client, so all of a user's folders show up without subscribing by hand.
+- Faster first mirror: the INBOX syncs first so it appears immediately, and because the box serves the local mailbox live, messages show up in the client as they download rather than only after the whole sync finishes.
+- Password changes behave like a normal account: if a user changes their university password, the box notices the university rejecting the stored one, drops the stored credentials, and the client prompts for the new password - which re-verifies against the university and resumes. The cached mail is kept, and a false alarm is harmless (the client just re-authenticates with its still-valid password).
+- Fixed a startup window where logins could fail for up to about 15 seconds after the mail container started: the login-socket permission fix from 2.0.1 now applies immediately instead of on the first periodic pass.
+- Quieter logs: the harmless Python crypt deprecation warning is no longer logged as an auth error.
+
 ## 2.0.1 - 2026-07-29
 
 Bug-fix release. No configuration changes; upgrade with `git pull` then `docker compose up -d --build`.

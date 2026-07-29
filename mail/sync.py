@@ -82,7 +82,9 @@ SyncState *
 """
 
 
-def sync_user(email: str):
+def sync_user(email: str, boxes=None):
+    """Reconcile the user's local Maildir with the university. `boxes` limits the
+    run to specific mailboxes (e.g. "INBOX") for a fast push; None syncs all."""
     try:
         with open(f"/mail/.creds/{email}/upass.enc", "rb") as fh:
             pw = a.decrypt_secret(fh.read())
@@ -96,16 +98,26 @@ def sync_user(email: str):
         fh.write(mbsyncrc(email, maildir))
         cfg = fh.name
     os.chmod(cfg, 0o600)
+    channel = "uni" if not boxes else f"uni:{boxes}"
+    label = boxes or "all folders"
     env = {**os.environ, "UNI_PW": pw}
     try:
-        r = subprocess.run(["mbsync", "-c", cfg, "uni"],
+        r = subprocess.run(["mbsync", "-c", cfg, channel],
                            env=env, capture_output=True, text=True, timeout=1800)
         if r.returncode == 0:
-            log(f"{email}: sync OK")
+            log(f"{email}: sync OK ({label})")
         else:
-            log(f"{email}: mbsync rc={r.returncode}: {(r.stderr or r.stdout).strip()[:400]}")
+            err = (r.stderr or r.stdout).strip()
+            log(f"{email}: mbsync rc={r.returncode} ({label}): {err[:400]}")
+            # If the university rejected the login (not a network hiccup), the user
+            # changed their password: drop the stored credentials so the client is
+            # prompted to re-enter it (see authcheck.deauth).
+            low = err.lower()
+            if ("authenticationfailed" in low or "authentication failed" in low
+                    or "login failed" in low):
+                a.deauth(email)
     except subprocess.TimeoutExpired:
-        log(f"{email}: sync timed out")
+        log(f"{email}: sync timed out ({label})")
     finally:
         os.unlink(cfg)
 

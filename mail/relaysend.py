@@ -54,8 +54,12 @@ def main() -> int:
         server.quit()
         return EX_OK
     except smtplib.SMTPAuthenticationError:
-        sys.stderr.write("relaysend: university rejected the sender's credentials\n")
-        return EX_NOPERM
+        # The stored password no longer works (the user changed their university
+        # password). Drop the credentials so the client is prompted to re-enter it,
+        # and defer this message so Postfix retries once the user has re-enrolled.
+        sys.stderr.write("relaysend: university rejected the sender's credentials; de-enrolling\n")
+        a.deauth(email)
+        return EX_TEMPFAIL
     except smtplib.SMTPRecipientsRefused as exc:
         sys.stderr.write(f"relaysend: recipients refused: {exc.recipients}\n")
         return EX_UNAVAILABLE

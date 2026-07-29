@@ -55,15 +55,19 @@ install -d -m 0770 -o vmail -g vmail /mail/.creds
       fi
   done ) &
 
-# 3b. Background mail sync: reconcile each enrolled user's local Maildir with
-#     their university mailbox on an interval (the prefetch). Runs as the mail
-#     user so it can read the master key and write the mailboxes.
-SYNC_INTERVAL="${SYNC_INTERVAL:-60}"
+# 3b. Background mail sync + push. idle.py (as the mail user, so it can read the
+#     master key and write the mailboxes) holds an IMAP IDLE connection to each
+#     enrolled user's university INBOX, so new mail is pulled in within a couple
+#     of seconds; it also runs the periodic full sync (every SYNC_INTERVAL) as a
+#     safety net and for other folders, syncs the INBOX first so it mirrors
+#     immediately, and subscribes the client to every synced folder. Supervised
+#     so a crash restarts it.
 ( while true; do
-      runuser -u vmail -- python3 /usr/local/bin/sync.py 2>&1 || true
-      sleep "$SYNC_INTERVAL"
+      runuser -u vmail -- python3 /usr/local/bin/idle.py 2>&1 || true
+      echo "[mail] sync/idle daemon exited; restarting in 5s."
+      sleep 5
   done ) &
-echo "[mail] mail sync loop started (every ${SYNC_INTERVAL}s)."
+echo "[mail] mail sync + IDLE push started."
 
 # 4. Configure and start Postfix: the SMTP submission endpoint on 587, using the
 #    same certificate and Dovecot for SASL, so IMAP and SMTP share one login.
@@ -127,14 +131,19 @@ trap 'echo "[mail] shutting down."; postfix stop 2>/dev/null || true; doveadm st
 #     the container. Backgrounded because Dovecot is exec'd as PID 1 below. The
 #     login/ directory itself stays 0750 (root:dovenull), so only Dovecot's own
 #     processes can reach these sockets regardless of the 0666 bits.
-( while true; do
-      if [ -d /run/dovecot/login ]; then
+( applied=0
+  while true; do
+      if [ -S /run/dovecot/login/login ]; then
           chmod g+x /run/dovecot/login 2>/dev/null || true
           for s in /run/dovecot/login/*; do
               [ -S "$s" ] && chmod 0666 "$s" 2>/dev/null || true
           done
+          applied=1
       fi
-      sleep 15
+      # Poll fast until the sockets exist and are fixed (Dovecot creates them a
+      # moment after this starts), so there is no startup window where logins
+      # fail; then relax to a periodic re-assert in case they are recreated.
+      if [ "$applied" = 1 ]; then sleep 15; else sleep 0.2; fi
   done ) &
 
 echo "[mail] starting Dovecot IMAPS on 993 for ${MAIL_HOSTNAME} (CERT_MODE=${CERT_MODE:-selfsigned})."

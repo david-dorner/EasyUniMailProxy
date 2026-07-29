@@ -13,7 +13,7 @@ It is a sister project to [EasyUniVPN](https://github.com/david-dorner/EasyUniVP
 ## How it works
 
 - One **carrier** university account (in `.env`) keeps the VPN tunnel up.
-- Each user's university mailbox is **synced into a local mailbox** and served by Dovecot, so reading is instant and works offline; new mail is prefetched.
+- Each user's university mailbox is **synced into a local mailbox** and served by Dovecot, so reading is instant and works offline. New mail arrives within a couple of seconds (the box holds an IMAP IDLE connection to the university and syncs the moment mail lands, with a periodic sync as a safety net), and all of your folders are subscribed automatically.
 - Outgoing mail is **queued and relayed** to the university as the sender, and retried until it lands, so sending survives a disconnect or a brief outage.
 
 For the full design, see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
