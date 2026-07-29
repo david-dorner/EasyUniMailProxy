@@ -113,6 +113,30 @@ echo "[mail] Postfix submission (587) up."
 # 5. Clean shutdown on docker stop: stop both services.
 trap 'echo "[mail] shutting down."; postfix stop 2>/dev/null || true; doveadm stop 2>/dev/null || true; fusermount3 -u /mail 2>/dev/null || true; exit 0' TERM INT
 
+# 5b. Keep Dovecot's login-service sockets connectable by the unprivileged login
+#     user. Dovecot's imap-login runs as "dovenull", which is neither the owner
+#     nor in the group of the root-owned sockets under /run/dovecot/login/ (the
+#     "login" auth socket and the "imap" backend-handoff socket), so it relies on
+#     their "other" write bit. On hosts whose container runtime directory carries
+#     a default ACL or a restrictive umask, that bit is stripped (sockets come up
+#     0664 instead of 0666); login then fails - either "auth-client: connect(login)
+#     ... Permission denied" (can't reach auth) or "master(imap): net_connect_unix
+#     (imap) failed" (can't hand off after auth) - and clients just see a
+#     connection error. Dovecot recreates these at startup (and could on a reload),
+#     so we re-assert the mode on every socket in that directory for the life of
+#     the container. Backgrounded because Dovecot is exec'd as PID 1 below. The
+#     login/ directory itself stays 0750 (root:dovenull), so only Dovecot's own
+#     processes can reach these sockets regardless of the 0666 bits.
+( while true; do
+      if [ -d /run/dovecot/login ]; then
+          chmod g+x /run/dovecot/login 2>/dev/null || true
+          for s in /run/dovecot/login/*; do
+              [ -S "$s" ] && chmod 0666 "$s" 2>/dev/null || true
+          done
+      fi
+      sleep 15
+  done ) &
+
 echo "[mail] starting Dovecot IMAPS on 993 for ${MAIL_HOSTNAME} (CERT_MODE=${CERT_MODE:-selfsigned})."
 # 6. Run Dovecot in the foreground so it is the container's main process.
 exec dovecot -F

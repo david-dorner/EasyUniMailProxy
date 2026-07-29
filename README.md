@@ -124,6 +124,7 @@ You can also **run it on your own machine** (WSL2 on Windows, natively on Linux,
 
 Check `docker compose logs -f mail`, `docker compose logs -f vpn`, and `docker compose logs -f watchdog`.
 
+- **`docker compose up` fails with "address already in use" on 993 or 587.** A container left in a partially-created state can keep the published port reserved even though nothing is actually listening on it (check with `sudo ss -ltnp | grep -E ':(993|587)'` - if that is empty, this is what happened). It shows up most often right after an upgrade, when the container that publishes the mail ports changes (in 2.0 it moved from `vpn` to `mail`), or after a repeated or interrupted `up`. A plain `docker compose down` does not always release it; force-remove the stack and its network, then bring it up again: `docker rm -f eump-mail eump-vpn eump-watchdog 2>/dev/null; docker network rm easyunimailproxy_eump 2>/dev/null; docker compose up -d`.
 - **The VPN will not authenticate.** Check the carrier `VPN_USERNAME` (plain email), `VPN_PASSWORD`, and `VPN_TOTP_SECRET`. Confirm them without opening the tunnel: `docker compose run --rm -e AUTH_ONLY=1 vpn`.
 - **The certificate does not issue.** For `cloudflare-dns`, check the API token has DNS edit permission on your zone and that `MAIL_HOSTNAME` / `ACME_EMAIL` are set. You can dry-run against Let's Encrypt staging with `ACME_STAGING=1`.
 - **A mailbox is empty at first.** The first sync can take a moment to fill; watch `docker compose logs -f mail` for the sync lines.
@@ -133,7 +134,7 @@ Check `docker compose logs -f mail`, `docker compose logs -f vpn`, and `docker c
 
 ## Versioning and updating
 
-`docker compose up -d` builds the images locally; there is nothing separate to publish. The `VERSION` file and the top of [CHANGELOG.md](CHANGELOG.md) carry the current version, and a GitHub release is published for each version. To update a deployment: `git pull` then `docker compose up -d --build`.
+`docker compose up -d` builds the images locally; there is nothing separate to publish. The `VERSION` file and the top of [CHANGELOG.md](CHANGELOG.md) carry the current version, and a GitHub release is published for each version. To update a deployment: `git pull` then `docker compose up -d --build`. When upgrading across the major version (1.x to 2.0), run a clean `docker compose down` first, because the container that publishes the mail ports changed; if `up` then reports `address already in use` on 993 or 587, see Troubleshooting.
 
 ## License
 

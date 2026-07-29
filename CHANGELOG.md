@@ -2,6 +2,13 @@
 
 All notable changes to EasyUniMailProxy are documented here. The version number of the latest entry must match the `VERSION` file; the release workflow reads both to publish a GitHub release automatically.
 
+## 2.0.1 - 2026-07-29
+
+Bug-fix release. No configuration changes; upgrade with `git pull` then `docker compose up -d --build`.
+
+- Fixed IMAP and SMTP login failing on some hosts with "auth-client: connect(login) ... Permission denied" or "master(imap): net_connect_unix(imap) failed". Dovecot's unprivileged login process could not reach its auth socket, nor the backend-handoff socket after a successful password check, when the container's runtime directory carried a default POSIX ACL (or a restrictive umask) that stripped the "other" write bit from those root-owned sockets. The mail container now keeps the login-service sockets connectable regardless of the host's ACL or umask, so login works on every host. The login directory itself stays 0750, so only Dovecot's own processes can reach the sockets.
+- Documented how to clear a stuck published port when upgrading, since the container that publishes the mail ports moved from the vpn container to the mail container (README troubleshooting).
+
 ## 2.0.0 - 2026-07-28
 
 Major architecture change. EasyUniMailProxy is now a small self-hosted mail server (it terminates the client's TLS with its own certificate), rather than a transparent passthrough. This removes the certificate warning on every device - including Thunderbird for Android, which cannot accept the passthrough's hostname-mismatched certificate at all - and adds a local, offline-capable mailbox with prefetch and a durable send queue.
@@ -15,7 +22,7 @@ The trade-off is deliberate and was chosen explicitly: the box now decrypts and 
 - Encryption at rest: the mail cache is stored on a gocryptfs filesystem and each user's university password is AES-encrypted, both keyed by a master key that is held only in memory at runtime and can be sealed to the machine's TPM (`KEY_MODE`: auto, tpm, autostart, or passphrase). A changed or lost key cannot read the old data and cannot corrupt it: the store re-initializes and re-syncs.
 - The watchdog now monitors the client-facing mail server and separately flags when the university path (sync/send) is unreachable.
 
-Upgrading from 1.x is not automatic: the deployment model and configuration have changed. See the README for the new setup.
+Upgrading from 1.x is not automatic: the deployment model and configuration have changed. See the README for the new setup. Because the container that publishes the mail ports changed (from `vpn` to `mail`), do a clean `docker compose down` before the first `docker compose up` on 2.0; if it reports `address already in use` on 993 or 587, clear the old stack and its network first (see the README Troubleshooting).
 
 ## 1.1.0 - 2026-07-27
 
