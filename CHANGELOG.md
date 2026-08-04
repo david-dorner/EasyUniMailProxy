@@ -2,6 +2,13 @@
 
 All notable changes to EasyUniMailProxy are documented here. The version number of the latest entry must match the `VERSION` file; the release workflow reads both to publish a GitHub release automatically.
 
+## 2.0.5 - 2026-08-04
+
+Fixes the special-use folder tags from 2.0.4 not actually reaching mail clients.
+
+- The first application of the special-use tags (Sent/Drafts/Trash/Junk on the localized folders) was silently lost: it was signalled to Dovecot with `doveadm reload` before Dovecot had started (it is only exec'd as the container's final, foreground step), so that reload failed with "Dovecot is not running" and, because the failure was swallowed, was never retried for an hour. The tags were written to disk correctly but never took effect, so clients kept seeing untagged folders and, for example, Thunderbird kept creating its own Trash. The apply step now tracks "written but not yet applied" separately from "no change", and retries every 5 seconds until the reload actually succeeds - which happens within moments of Dovecot starting.
+- If your client already created its own English folders before this fix, it may keep using them until you remove and re-add the account (or otherwise make it re-evaluate folder roles), since most clients only assign special-use roles at initial folder discovery.
+
 ## 2.0.4 - 2026-08-04
 
 Auto-recognized special folders. Upgrade with `git pull` then `docker compose up -d --build`.

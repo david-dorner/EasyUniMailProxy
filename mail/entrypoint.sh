@@ -76,15 +76,29 @@ echo "[mail] mail sync + IDLE push started."
 #     university's OWN special-use flags - no folder names are hardcoded - and
 #     writes /etc/dovecot/special-use.conf; we reload Dovecot when it changes.
 #     Polls until it can discover (a user is enrolled and the tunnel is up), then
-#     relaxes to an hourly refresh in case the folders change.
+#     relaxes to an hourly refresh in case the folders change. The reload itself
+#     is retried on its own short cycle: Dovecot is not started until step 6 (it
+#     is exec'd as the final, foreground step), so a change discovered before
+#     then must not be dropped just because doveadm reload had nothing to signal
+#     yet - "no reload needed" (rc 0) and "reload not yet applied" are different
+#     states, tracked separately.
 ( interval="${SPECIALUSE_POLL:-30}"
+  pending=0
   while true; do
       /usr/local/bin/special_use.py; rc=$?
       case "$rc" in
-          10) doveadm reload 2>/dev/null || true; echo "[mail] special-use folder tags applied."; interval=3600 ;;
+          10) pending=1; interval=3600 ;;
           0)  interval=3600 ;;
           *)  interval="${SPECIALUSE_POLL:-30}" ;;
       esac
+      if [ "$pending" = 1 ]; then
+          if doveadm reload 2>/dev/null; then
+              pending=0
+              echo "[mail] special-use folder tags applied."
+          else
+              interval=5  # Dovecot not up yet (or briefly reloading); retry soon
+          fi
+      fi
       sleep "$interval"
   done ) &
 
