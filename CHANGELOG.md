@@ -2,6 +2,12 @@
 
 All notable changes to EasyUniMailProxy are documented here. The version number of the latest entry must match the `VERSION` file; the release workflow reads both to publish a GitHub release automatically.
 
+## 2.0.4 - 2026-08-04
+
+Auto-recognized special folders. Upgrade with `git pull` then `docker compose up -d --build`.
+
+- The box now advertises the university's own SPECIAL-USE flags (Sent, Drafts, Trash, Junk, Archive) on the localized folders, so mail clients auto-recognize them - "Gesendete Elemente" is used as Sent, "Entwürfe" as Drafts, and so on - with no manual folder setup and no more client-created English duplicates. The mapping is read from the university's own flags (RFC 6154), so no folder names are hardcoded and it adapts to any locale. It is discovered once a user is enrolled and refreshed hourly.
+
 ## 2.0.3 - 2026-07-29
 
 Folder handling fixes. Upgrade with `git pull` then `docker compose up -d --build`.

@@ -69,6 +69,25 @@ install -d -m 0770 -o vmail -g vmail /mail/.creds
   done ) &
 echo "[mail] mail sync + IDLE push started."
 
+# 3c. Tag the university's special folders (Sent/Drafts/Trash/Junk/Archive) with
+#     their roles so every mail client auto-recognizes the localized folder names
+#     and does not create its own duplicates. special_use.py (as root: it writes
+#     Dovecot config) logs in to the university as an enrolled user, reads the
+#     university's OWN special-use flags - no folder names are hardcoded - and
+#     writes /etc/dovecot/special-use.conf; we reload Dovecot when it changes.
+#     Polls until it can discover (a user is enrolled and the tunnel is up), then
+#     relaxes to an hourly refresh in case the folders change.
+( interval="${SPECIALUSE_POLL:-30}"
+  while true; do
+      /usr/local/bin/special_use.py; rc=$?
+      case "$rc" in
+          10) doveadm reload 2>/dev/null || true; echo "[mail] special-use folder tags applied."; interval=3600 ;;
+          0)  interval=3600 ;;
+          *)  interval="${SPECIALUSE_POLL:-30}" ;;
+      esac
+      sleep "$interval"
+  done ) &
+
 # 4. Configure and start Postfix: the SMTP submission endpoint on 587, using the
 #    same certificate and Dovecot for SASL, so IMAP and SMTP share one login.
 #    Outbound relay to the university is added in a later phase; for now it only
