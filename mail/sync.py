@@ -75,11 +75,17 @@ Channel uni
 Far :uni-remote:
 Near :uni-local:
 Patterns {SYNC_PATTERNS}
-Create Both
+Create Near
 Expunge Both
 {maxmsg}Sync {SYNC_MODE}
 SyncState *
 """
+# Create Near (not Both): folders are only ever created LOCALLY to mirror the
+# university - we never create a folder on the university side. This keeps the
+# box a faithful mirror of exactly the folders the university exposes and stops a
+# client's own folders (e.g. Thunderbird's English "Sent"/"Drafts") from being
+# pushed up and polluting the real mailbox. Messages and flags still sync both
+# ways for folders that exist on both sides.
 
 
 def sync_user(email: str, boxes=None):

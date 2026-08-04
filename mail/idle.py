@@ -95,28 +95,39 @@ def _names(lines):
     return out
 
 
-def subscribe_all(email, password):
-    """Subscribe the client to every folder, through the local Dovecot, so the
-    user sees all their mail without subscribing by hand. Uses Dovecot's own
-    SUBSCRIBE (so the on-disk format is always right) and only adds folders that
-    are not subscribed yet."""
+def subscribe_once(email, password):
+    """Give a mailbox its folder subscriptions ONCE, then never touch them again,
+    so the user's own choices are what stick. A marker file records that the
+    one-time pass ran. Because subscriptions live on the box, the user's selection
+    is automatically shared across all of their devices.
+
+    The one-time pass only helps a brand-new mailbox (nothing subscribed yet): it
+    subscribes every folder for initial visibility. An existing mailbox that
+    already has a subscription selection is left exactly as the user set it - we
+    just record the marker and stop, so a reconnect never re-subscribes anything."""
+    marker = f"/mail/.creds/{email}/subscribed"
+    if os.path.exists(marker):
+        return  # the one-time pass already ran; the user's choices are authoritative
     m = None
     try:
         ctx = ssl._create_unverified_context()  # local self-connection to our own IMAP
         m = imaplib.IMAP4_SSL(*LOCAL_IMAP, ssl_context=ctx, timeout=30)
         m.login(email, password)
-        have = set(_names(m.lsub()[1]))
+        already = set(_names(m.lsub()[1])) - {"INBOX"}
         added = 0
-        for name in _names(m.list()[1]):
-            if name.upper() == "INBOX" or name in have:
-                continue
-            try:
-                if m.subscribe('"%s"' % name)[0] == "OK":
-                    added += 1
-            except Exception:  # noqa: BLE001
-                pass
+        if not already:  # brand-new mailbox: subscribe everything once for visibility
+            for name in _names(m.list()[1]):
+                if name.upper() == "INBOX":
+                    continue
+                try:
+                    if m.subscribe('"%s"' % name)[0] == "OK":
+                        added += 1
+                except Exception:  # noqa: BLE001
+                    pass
+        with open(marker, "w"):
+            pass  # record that the one-time subscribe has been done
         if added:
-            log(f"{email}: subscribed {added} new folder(s)")
+            log(f"{email}: subscribed {added} folder(s) once; will not auto-subscribe again")
     except Exception as exc:  # noqa: BLE001
         log(f"{email}: subscribe skipped ({exc})")
     finally:
@@ -193,8 +204,8 @@ def watch_user(email):
                     time.sleep(3600)
             conn.select("INBOX", readonly=True)  # read-only: never touch flags
             log(f"{email}: watching INBOX for new mail")
-            sync_all_folders(email)   # catch up on anything missed while away
-            subscribe_all(email, pw)  # make every folder visible
+            sync_all_folders(email)    # catch up on anything missed while away
+            subscribe_once(email, pw)  # one-time initial subscribe; then hands off to the user
             backoff = 5
             while True:
                 if _idle_wait(conn, IDLE_REFRESH):

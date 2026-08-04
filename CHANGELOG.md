@@ -2,6 +2,13 @@
 
 All notable changes to EasyUniMailProxy are documented here. The version number of the latest entry must match the `VERSION` file; the release workflow reads both to publish a GitHub release automatically.
 
+## 2.0.3 - 2026-07-29
+
+Folder handling fixes. Upgrade with `git pull` then `docker compose up -d --build`.
+
+- The box no longer creates folders on the university side. Sync now mirrors the university's folders down only (mbsync `Create Near`), so a mail client's own folders - for example Thunderbird's English "Sent"/"Drafts", which it creates when it does not recognize the German ones - are never pushed up and can no longer pollute the real university mailbox. Messages and flags still sync both ways for folders that exist on both sides.
+- Folder subscriptions are a one-time convenience, then yours to control. A brand-new mailbox gets its folders subscribed once for initial visibility; after that the box never re-subscribes, so your own selection sticks - and, because subscriptions live on the box, it is shared across all your devices. Previously it re-subscribed every folder on each reconnect, overriding your choices.
+
 ## 2.0.2 - 2026-07-29
 
 Near-instant mail, automatic folders, and native password-change handling. No configuration changes; upgrade with `git pull` then `docker compose up -d --build`.
