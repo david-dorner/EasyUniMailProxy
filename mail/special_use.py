@@ -13,16 +13,15 @@ Exit codes: 10 = the generated include changed (caller should reload Dovecot);
 0 = already up to date; 1 = could not discover yet (no enrolled user, or the
 university was unreachable) - the caller just tries again later.
 """
-import base64
 import glob
 import imaplib
 import os
-import re
 import ssl
 import sys
 
 sys.path.insert(0, "/usr/local/bin")
 import authcheck as a  # decrypt_secret + upstream_user
+from imap_list import parse_list  # shared LIST parsing + UTF-7 decode
 
 OUT = "/etc/dovecot/special-use.conf"
 HOST = os.environ.get("UPSTREAM_IMAP_HOST", "email.uni-graz.at")
@@ -30,37 +29,10 @@ PORT = int(os.environ.get("UPSTREAM_IMAP_PORT", "993"))
 # The RFC 6154 roles we mirror. We take whatever the university advertises; we do
 # not assume any particular folder name.
 ROLE_FLAGS = ("\\Sent", "\\Drafts", "\\Trash", "\\Junk", "\\Archive", "\\All", "\\Flagged")
-_LIST_RE = re.compile(rb'^\((?P<flags>[^)]*)\)\s+(?:"[^"]*"|NIL)\s+(?P<name>.+)$')
 
 
 def log(msg):
     sys.stderr.write(f"[special-use] {msg}\n")
-
-
-def _imap_utf7_decode(s: str) -> str:
-    """Decode IMAP modified UTF-7 (RFC 3501) folder names to real UTF-8, so the
-    Dovecot config matches the folder (e.g. 'Entw&APw-rfe' -> 'Entwürfe')."""
-    out = []
-    i = 0
-    while i < len(s):
-        c = s[i]
-        if c == "&":
-            j = s.find("-", i)
-            if j == -1:
-                out.append(s[i:])
-                break
-            chunk = s[i + 1:j]
-            if chunk == "":
-                out.append("&")  # '&-' is a literal '&'
-            else:
-                b64 = chunk.replace(",", "/")
-                b64 += "=" * (-len(b64) % 4)
-                out.append(base64.b64decode(b64).decode("utf-16-be"))
-            i = j + 1
-        else:
-            out.append(c)
-            i += 1
-    return "".join(out)
 
 
 def enrolled_users():
@@ -81,18 +53,10 @@ def discover(email: str) -> dict:
         except Exception:  # noqa: BLE001
             pass
     mapping = {}
-    for raw in lines:
-        mm = _LIST_RE.match(raw.strip())
-        if not mm:
-            continue
-        flags = mm.group("flags").decode("ascii", "replace").split()
+    for name, flags, _sep in parse_list(lines):
         role = next((f for f in flags if f in ROLE_FLAGS), None)
-        if not role:
-            continue
-        name = mm.group("name").strip()
-        if name.startswith(b'"') and name.endswith(b'"'):
-            name = name[1:-1]
-        mapping[_imap_utf7_decode(name.decode("ascii", "replace"))] = role
+        if role:
+            mapping[name] = role
     return mapping
 
 

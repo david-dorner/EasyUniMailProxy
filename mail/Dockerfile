@@ -56,14 +56,15 @@ COPY dovecot/dovecot.conf /etc/dovecot/dovecot.conf
 COPY cert.sh /usr/local/bin/cert.sh
 COPY keys.sh /usr/local/bin/keys.sh
 COPY authcheck.py /usr/local/bin/authcheck.py
+COPY imap_list.py /usr/local/bin/imap_list.py
 COPY sync.py /usr/local/bin/sync.py
 COPY idle.py /usr/local/bin/idle.py
 COPY special_use.py /usr/local/bin/special_use.py
 COPY relaysend.py /usr/local/bin/relaysend.py
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /usr/local/bin/cert.sh /usr/local/bin/keys.sh /usr/local/bin/authcheck.py \
-             /usr/local/bin/sync.py /usr/local/bin/idle.py /usr/local/bin/special_use.py \
-             /usr/local/bin/relaysend.py /entrypoint.sh
+             /usr/local/bin/imap_list.py /usr/local/bin/sync.py /usr/local/bin/idle.py \
+             /usr/local/bin/special_use.py /usr/local/bin/relaysend.py /entrypoint.sh
 
 EXPOSE 993
 ENTRYPOINT ["/entrypoint.sh"]

@@ -2,6 +2,13 @@
 
 All notable changes to EasyUniMailProxy are documented here. The version number of the latest entry must match the `VERSION` file; the release workflow reads both to publish a GitHub release automatically.
 
+## 2.0.6 - 2026-10-06
+
+Fixes mail silently stopping when the university renames or retires a folder. Upgrade with `git pull` then `docker compose up -d --build`.
+
+- A folder mbsync once mirrored locally (e.g. an old plain "Sent"/"Drafts"/"Spam" the university used to expose before switching to its Exchange locale's own names, "Gesendete Elemente"/"Entwürfe"/"Junk-E-Mail") could outlive its counterpart on the university side. mbsync treats "far side box cannot be opened" as fatal to the *whole* sync channel, so one orphaned local folder silently blocked sync for every folder, including the INBOX - with no error visible to the user beyond mail simply not arriving. Before every full sync, the box now checks the university's live folder list and moves any local folder that no longer exists there out of the way (mail kept, not deleted, under each user's `stale-folders/`), so this now degrades to "that one old folder stops updating" instead of "nothing syncs".
+- Also fixed: two local messages that had been assigned duplicate Maildir UIDs (one by the normal sync, one written independently by Dovecot) triggered the same fatal, whole-channel failure. mbsync re-numbers them cleanly now that the collision is gone.
+
 ## 2.0.5 - 2026-08-04
 
 Fixes the special-use folder tags from 2.0.4 not actually reaching mail clients.

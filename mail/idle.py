@@ -26,7 +26,6 @@ Env knobs (optional): everything sync.py reads, plus
 """
 import imaplib
 import os
-import re
 import socket
 import ssl
 import sys
@@ -36,6 +35,7 @@ import time
 sys.path.insert(0, "/usr/local/bin")
 import authcheck as a  # decrypt_secret + upstream_user + the credential layout
 import sync            # enrolled_users + sync_user (mbsync)
+from imap_list import list_names  # shared LIST parsing + UTF-7 decode
 
 HOST = sync.MAIL_SERVER
 PORT = int(os.environ.get("UPSTREAM_IMAP_PORT", "993"))
@@ -77,24 +77,6 @@ def sync_inbox(email):
 
 
 # -- Folder subscriptions: make every synced folder visible to the client -----
-_LIST_RE = re.compile(rb'^\([^)]*\)\s+(?:"[^"]*"|NIL)\s+(?P<name>.+)$')
-
-
-def _names(lines):
-    out = []
-    for raw in lines or []:
-        if not raw:
-            continue
-        m = _LIST_RE.match(raw.strip())
-        if not m:
-            continue
-        name = m.group("name").strip()
-        if name.startswith(b'"') and name.endswith(b'"'):
-            name = name[1:-1]
-        out.append(name.decode("ascii", "replace"))
-    return out
-
-
 def subscribe_once(email, password):
     """Give a mailbox its folder subscriptions ONCE, then never touch them again,
     so the user's own choices are what stick. A marker file records that the
@@ -113,10 +95,10 @@ def subscribe_once(email, password):
         ctx = ssl._create_unverified_context()  # local self-connection to our own IMAP
         m = imaplib.IMAP4_SSL(*LOCAL_IMAP, ssl_context=ctx, timeout=30)
         m.login(email, password)
-        already = set(_names(m.lsub()[1])) - {"INBOX"}
+        already = set(list_names(m.lsub()[1])) - {"INBOX"}
         added = 0
         if not already:  # brand-new mailbox: subscribe everything once for visibility
-            for name in _names(m.list()[1]):
+            for name in list_names(m.list()[1]):
                 if name.upper() == "INBOX":
                     continue
                 try:
